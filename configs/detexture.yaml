@@ -1,0 +1,67 @@
+seed: 42
+
+model:
+  qwen_model: "Qwen/Qwen3-VL-8B-Instruct"
+  qwen_dtype: "bfloat16"
+  gradient_checkpointing: true
+
+  # Qwen LoRA
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+  lora_target_modules: ["q_proj", "v_proj"]
+
+  # SAM3
+  sam3_checkpoint: null  # downloads from HF
+  image_size: 1008
+  sam3_lr_scale: 0.1
+
+  # SAM3 Orthogonal LoRA
+  sam3_lora_r: 8
+  sam3_lora_alpha: 16.0
+  sam3_lora_n_singular: 32
+  sam3_lora_targets: ["q", "v"]
+
+  # Text alignment
+  clip_model: "openai/clip-vit-base-patch32"
+  clip_dim: 512
+
+data:
+  train_metadata: "data/train_metadata.json"
+  val_metadata: "data/val_metadata.json"
+  image_size: 1008
+  augment: true
+  num_workers: 2
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  max_grad_norm: 1.0
+
+  # Segmentation gradient warmup: for the first N epochs,
+  # detach tex_embeds before segmentation path so Qwen LoRA
+  # stabilizes on LM + alignment before adding seg gradients.
+  seg_grad_warmup_epochs: 10
+
+  # Checkpoint
+  checkpoint_dir: "checkpoints"
+  save_every: 5
+
+loss:
+  mask_weight: 1.0
+  ce_weight: 1.0
+  dice_weight: 1.0
+  text_contrastive_weight: 0.5
+  count_weight: 0.1
+  lm_weight: 0.5
+  orthogonal_weight: 0.01
+
+# Hungarian matching
+matching:
+  text_weight: 0.5
+  mask_weight: 0.5
