@@ -488,20 +488,20 @@ Each mask is a binary PNG where white pixels belong to that texture. The dustbin
 
 ```
 +-----------------------------------------------------------+
-|                    TRAINABLE COMPONENTS                     |
+|                    TRAINABLE COMPONENTS                   |
 +-----------------------------------------------------------+
 | Qwen3-VL LoRA (q_proj, v_proj)          ~4M params        |
-| MLP Projector (2048->1024->512->256)     ~1.6M params      |
-| Multi-Texture Mask Head                  ~0.2M params      |
-| DUSTBIN embedding                        2048 params       |
+| MLP Projector (2048->1024->512->256)     ~1.6M params     |
+| Multi-Texture Mask Head                  ~0.2M params     |
+| DUSTBIN embedding                        2048 params      |
 | SAM3 Orthogonal LoRA (cross-attn Q,V)   ~0.1M params      |
-| Text alignment head                      ~1M params        |
+| Text alignment head                      ~1M params       |
 +-----------------------------------------------------------+
-| TOTAL TRAINABLE                          ~7M params        |
+| TOTAL TRAINABLE                          ~7M params       |
 +-----------------------------------------------------------+
 
 +-----------------------------------------------------------+
-|                      FROZEN COMPONENTS                     |
+|                      FROZEN COMPONENTS                    |
 +-----------------------------------------------------------+
 | Qwen3-VL base weights                   ~8B params        |
 | SAM3 Image Encoder (ViT backbone)       ~300M params      |
