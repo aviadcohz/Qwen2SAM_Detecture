@@ -387,6 +387,7 @@ class TrainingLogger:
 
     def _log(self, record: dict):
         self.log_file.write(json.dumps(record) + "\n")
+        self.log_file.flush()
 
     def close(self):
         self._log({"type": "end", "timestamp": datetime.now().isoformat(),
@@ -463,16 +464,15 @@ class PlotGenerator:
         plt.close(fig)
 
     def _plot_val_miou(self, logger, plt):
-        """Validation mIoU over epochs."""
+        """Validation mIoU over epochs with key baselines."""
         epochs = [r["epoch"] for r in logger.epoch_history]
         mious = [r["val_miou"] for r in logger.epoch_history]
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(epochs, mious, "r-o", markersize=3, label="Val mIoU")
+        ax.plot(epochs, mious, "r-o", markersize=4, linewidth=1.5, label="Val mIoU")
 
         # Mark best
         best_idx = np.argmax(mious)
-        ax.axhline(mious[best_idx], color="r", linestyle="--", alpha=0.3)
         ax.annotate(f"Best: {mious[best_idx]:.4f} (ep {epochs[best_idx]})",
                      xy=(epochs[best_idx], mious[best_idx]),
                      xytext=(10, 10), textcoords="offset points",
@@ -482,100 +482,137 @@ class PlotGenerator:
         if logger.test_history:
             t_epochs = [r["epoch"] for r in logger.test_history]
             t_mious = [r.get("test_miou", 0) for r in logger.test_history]
-            ax.plot(t_epochs, t_mious, "b-s", markersize=5, label="Test mIoU (RWTD)")
+            ax.plot(t_epochs, t_mious, "b-s", markersize=6, linewidth=1.5,
+                    label="Test mIoU (RWTD)")
 
-        # Draw baseline reference lines
+        # Draw only the 3 most important baseline reference lines
+        key_baselines = {}
         for name, bl in self.baselines.items():
-            if "miou" in bl:
-                ax.axhline(bl["miou"], color="gray", linestyle="--", alpha=0.6)
-                ax.text(ax.get_xlim()[1] * 0.02, bl["miou"] + 0.01,
-                        f'{name} ({bl["miou"]:.3f})', fontsize=8, color="gray")
+            if "miou" in bl and bl["miou"] > 0:
+                key_baselines[name] = bl["miou"]
+        # Keep only top 3 by value to avoid clutter
+        sorted_bl = sorted(key_baselines.items(), key=lambda x: -x[1])[:3]
+        colors_bl = ["#999999", "#bbbbbb", "#dddddd"]
+        for i, (name, miou) in enumerate(sorted_bl):
+            short_name = name.replace("qwen_", "").replace("_parsed", "")
+            if len(short_name) > 25:
+                short_name = short_name[:22] + "..."
+            ax.axhline(miou, color=colors_bl[min(i, 2)], linestyle="--",
+                        alpha=0.7, linewidth=0.8)
+            ax.text(0.02, miou + 0.008, f'{short_name} ({miou:.3f})',
+                    fontsize=7, color="#666666", transform=ax.get_yaxis_transform())
 
         ax.set_xlabel("Epoch")
         ax.set_ylabel("mIoU")
         ax.set_title("Segmentation Quality (mIoU)")
         ax.set_ylim(0, 1)
         ax.grid(True, alpha=0.3)
-        ax.legend()
+        ax.legend(loc="lower right")
         fig.savefig(self.plot_dir / "val_miou.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
     def _plot_loss_components(self, logger, plt):
-        """Loss components on separate panels so LM loss doesn't squash mask losses."""
+        """Loss components on 3 separate panels: Mask, LM, Orth."""
         epochs = [r["epoch"] for r in logger.epoch_history]
 
-        # Split into mask losses (small scale) and LM loss (large scale)
-        mask_components = [
-            ("mask_ce", "#e41a1c", "CE"),
-            ("mask_dice", "#377eb8", "Dice"),
-            ("orthogonal_reg", "#a65628", "Orth Reg"),
-        ]
-        lm_key = "lm_loss"
+        ce_vals = [r.get("train_mask_ce", 0) for r in logger.epoch_history]
+        dice_vals = [r.get("train_mask_dice", 0) for r in logger.epoch_history]
+        lm_vals = [r.get("train_lm_loss", 0) for r in logger.epoch_history]
+        orth_vals = [r.get("train_orthogonal_reg", 0) for r in logger.epoch_history]
 
-        lm_vals = [r.get(f"train_{lm_key}", 0) for r in logger.epoch_history]
-        has_lm = any(v > 0 for v in lm_vals)
+        # Determine how many panels we need (always mask, conditionally LM + Orth)
+        panels = [("mask", True)]
+        if any(v > 0 for v in lm_vals):
+            panels.append(("lm", True))
+        if any(v > 0 for v in orth_vals):
+            panels.append(("orth", True))
 
-        n_panels = 2 if has_lm else 1
-        fig, axes = plt.subplots(n_panels, 1, figsize=(12, 4 * n_panels),
-                                  sharex=True)
-        if n_panels == 1:
+        n = len(panels)
+        fig, axes = plt.subplots(n, 1, figsize=(12, 3.5 * n), sharex=True)
+        if n == 1:
             axes = [axes]
 
-        # Panel 1: Mask losses (CE, Dice, Orth)
-        ax1 = axes[0]
-        for comp, color, label in mask_components:
-            vals = [r.get(f"train_{comp}", 0) for r in logger.epoch_history]
-            if any(v > 0 for v in vals):
-                ax1.plot(epochs, vals, color=color, linewidth=1.5,
-                         marker="o", markersize=3, label=label)
-        ax1.set_ylabel("Loss Value")
-        ax1.set_title("Mask Losses (CE + Dice + Orth)")
-        ax1.grid(True, alpha=0.3)
-        ax1.legend(loc="upper right")
+        # Panel 1: Mask losses (CE + Dice)
+        ax = axes[0]
+        ax.plot(epochs, ce_vals, color="#e41a1c", linewidth=1.5,
+                marker="o", markersize=3, label="CE")
+        ax.plot(epochs, dice_vals, color="#377eb8", linewidth=1.5,
+                marker="o", markersize=3, label="Dice")
+        ax.set_ylabel("Loss")
+        ax.set_title("Mask Losses (CE + Dice)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right")
 
-        # Panel 2: LM loss (separate scale)
-        if has_lm:
-            ax2 = axes[1]
-            ax2.plot(epochs, lm_vals, color="#ff7f00", linewidth=1.5,
-                     marker="s", markersize=4, label="LM Loss ([SEG] only)")
-            ax2.set_xlabel("Epoch")
-            ax2.set_ylabel("LM Loss")
-            ax2.set_title("LM Loss (predicting <|seg|> tokens)")
-            ax2.grid(True, alpha=0.3)
-            ax2.legend(loc="upper right")
-        else:
-            ax1.set_xlabel("Epoch")
+        panel_idx = 1
 
+        # Panel 2: LM loss
+        if any(v > 0 for v in lm_vals):
+            ax = axes[panel_idx]
+            ax.plot(epochs, lm_vals, color="#ff7f00", linewidth=1.5,
+                    marker="s", markersize=4, label="LM ([SEG] only)")
+            ax.set_ylabel("LM Loss")
+            ax.set_title("LM Loss (predicting <|seg|> tokens)")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right")
+            panel_idx += 1
+
+        # Panel 3: Orthogonal regularisation
+        if any(v > 0 for v in orth_vals):
+            ax = axes[panel_idx]
+            ax.plot(epochs, orth_vals, color="#a65628", linewidth=1.5,
+                    marker="^", markersize=4, label="Orth Reg (SAM LoRA)")
+            ax.set_ylabel("Orth Loss")
+            ax.set_title("Orthogonal Regularisation (SAM LoRA)")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right")
+            panel_idx += 1
+
+        axes[-1].set_xlabel("Epoch")
         fig.tight_layout()
         fig.savefig(self.plot_dir / "loss_components.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
     def _plot_test_metrics(self, logger, plt):
-        """Test set mIoU and mARI."""
+        """Test set mIoU and mARI with clean baselines."""
         epochs = [r["epoch"] for r in logger.test_history]
         mious = [r.get("test_miou", 0) for r in logger.test_history]
         maris = [r.get("test_mari", 0) for r in logger.test_history]
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-        ax1.plot(epochs, mious, "b-o", markersize=5)
-        for name, bl in self.baselines.items():
-            if "miou" in bl:
-                ax1.axhline(bl["miou"], color="gray", linestyle="--", alpha=0.6)
-                ax1.text(ax1.get_xlim()[1] * 0.02, bl["miou"] + 0.01,
-                         f'{name} ({bl["miou"]:.3f})', fontsize=8, color="gray")
+        ax1.plot(epochs, mious, "b-o", markersize=6, linewidth=1.5)
+
+        # Filter out broken mARI entries (near-zero from failed inference)
+        valid_mari = [(e, m) for e, m in zip(epochs, maris) if abs(m) > 0.01]
+        if valid_mari:
+            m_epochs, m_vals = zip(*valid_mari)
+            ax2.plot(m_epochs, m_vals, "g-o", markersize=6, linewidth=1.5)
+        else:
+            ax2.text(0.5, 0.5, "mARI not yet available\n(awaiting next test eval)",
+                     ha="center", va="center", fontsize=10, color="#888888",
+                     transform=ax2.transAxes)
+
+        # Add only top 3 baselines to each axis
+        for ax, metric_key in [(ax1, "miou"), (ax2, "mari")]:
+            key_bl = {n: bl[metric_key] for n, bl in self.baselines.items()
+                      if metric_key in bl and bl[metric_key] > 0}
+            sorted_bl = sorted(key_bl.items(), key=lambda x: -x[1])[:3]
+            for i, (name, val) in enumerate(sorted_bl):
+                short = name.replace("qwen_", "").replace("_parsed", "")
+                if len(short) > 25:
+                    short = short[:22] + "..."
+                ax.axhline(val, color="#aaaaaa", linestyle="--", alpha=0.6,
+                            linewidth=0.8)
+                ax.text(0.02, val + 0.008, f'{short} ({val:.3f})',
+                        fontsize=7, color="#666666",
+                        transform=ax.get_yaxis_transform())
+
         ax1.set_xlabel("Epoch")
         ax1.set_ylabel("mIoU")
         ax1.set_title("Test Set mIoU (RWTD)")
         ax1.set_ylim(0, 1)
         ax1.grid(True, alpha=0.3)
 
-        ax2.plot(epochs, maris, "g-o", markersize=5)
-        for name, bl in self.baselines.items():
-            if "mari" in bl:
-                ax2.axhline(bl["mari"], color="gray", linestyle="--", alpha=0.6)
-                ax2.text(ax2.get_xlim()[1] * 0.02, bl["mari"] + 0.01,
-                         f'{name} ({bl["mari"]:.3f})', fontsize=8, color="gray")
         ax2.set_xlabel("Epoch")
         ax2.set_ylabel("mARI")
         ax2.set_title("Test Set mARI (RWTD)")
@@ -701,7 +738,13 @@ class TestEvaluator:
     def evaluate(self, model, processor, device, epoch: int,
                  **kwargs) -> dict:
         """
-        Run full evaluation on the test set.
+        Oracle Evaluation: bypasses Qwen generation, feeds GT descriptions
+        through the training forward() path (block-diagonal mask, [SEG]
+        extraction, bottleneck projector, SAM).
+
+        This establishes the architectural upper bound — the maximum mIoU
+        achievable when text conditioning is perfect. Used to track the
+        geometric architecture's generalization during training.
 
         Returns dict with metrics: test_miou, test_mari, per_sample_results.
         """
@@ -712,8 +755,9 @@ class TestEvaluator:
             image_size=self.image_size,
             augment=False,
         )
-        # Inference collator: no assistant text, just generation prompt
-        collator = DeTextureCollator(processor, inference=True)
+        # TRAINING collator (inference=False) — includes GT assistant text
+        # with <|seg|> tokens for teacher-forced forward()
+        collator = DeTextureCollator(processor, inference=False)
         test_loader = torch.utils.data.DataLoader(
             test_ds, batch_size=1, shuffle=False,
             num_workers=0, collate_fn=collator,
@@ -734,9 +778,12 @@ class TestEvaluator:
             index_masks = batch["index_masks"]  # (1, H, W)
             k_gts = batch["k_gts"]
 
+            # Oracle: use training forward() with GT text, no generation
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model.inference_forward(
-                    qwen_inputs=qwen_inputs, sam_images=sam_images,
+                out = model.forward(
+                    qwen_inputs=qwen_inputs,
+                    sam_images=sam_images,
+                    seg_grad_to_lm=False,
                 )
 
             mask_logits = out["mask_logits"]  # (1, C, H, W)
@@ -771,16 +818,13 @@ class TestEvaluator:
                 idx, epoch_dir, batch, pred, gt, sample_iou, ari, k_gt, k_pred,
             )
 
-            # Extract Qwen's generated texture descriptions
-            generated_text = out.get("generated_text", [""])[0]
-
             per_sample.append({
                 "idx": idx,
                 "miou": sample_iou,
                 "ari": ari,
                 "k_gt": k_gt,
                 "k_pred": k_pred,
-                "generated_text": generated_text,
+                "generated_text": "(Oracle — GT descriptions used)",
             })
 
         test_miou = np.mean(all_ious) if all_ious else 0.0

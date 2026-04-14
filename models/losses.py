@@ -86,7 +86,56 @@ def orthogonal_regularization(model):
 
 
 # ===================================================================== #
-#  V5 Combined Loss                                                       #
+#  V6 Proximity-Decayed LM Loss                                           #
+# ===================================================================== #
+
+def weighted_lm_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    lm_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Per-token weighted language model loss with cosine-decayed weights.
+
+    Instead of binary -100 masking (V5), each token gets a continuous
+    weight from the Proximity Decay schedule: high at the start of each
+    TEXTURE block (linguistic anchor) and low near <|seg|> (geometric
+    freedom).
+
+    Args:
+        logits:     (B, L, V) raw Qwen logits.
+        labels:     (B, L) token IDs (-100 for ignored positions).
+        lm_weights: (B, L) per-token cosine-decayed weights.
+
+    Returns:
+        Scalar weighted LM loss.
+    """
+    # Standard causal LM shift: predict token i+1 from position i
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    shift_weights = lm_weights[..., 1:].contiguous()
+
+    B, L, V = shift_logits.shape
+
+    # Per-token CE (no reduction)
+    per_token_loss = F.cross_entropy(
+        shift_logits.view(-1, V),
+        shift_labels.view(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).view(B, L)
+
+    # Apply cosine-decayed weights (0 where labels == -100)
+    valid_mask = (shift_labels != -100).float()
+    weighted = per_token_loss * shift_weights * valid_mask
+
+    # Normalise by total weight (not count — heavier tokens count more)
+    total_weight = (shift_weights * valid_mask).sum().clamp(min=1e-6)
+    return weighted.sum() / total_weight
+
+
+# ===================================================================== #
+#  V6 Combined Loss                                                       #
 # ===================================================================== #
 
 def combined_loss(
@@ -97,12 +146,16 @@ def combined_loss(
     lm_loss: torch.Tensor,
     model: nn.Module,
     cfg: dict,
+    qwen_logits: torch.Tensor = None,
+    labels: torch.Tensor = None,
+    lm_weights: torch.Tensor = None,
 ) -> dict:
     """
-    V5 combined loss: Mask (CE + Dice) + LM ([SEG]-only) + Orthogonal.
+    V6 combined loss: Mask (CE + Dice) + Proximity-Decayed LM + Orthogonal.
 
-    The mask loss is the dominant signal. LM loss is minimal (only [SEG]
-    token prediction due to -100 masking on all text tokens).
+    If qwen_logits + labels + lm_weights are provided, uses the V6
+    proximity-decayed weighted LM loss. Otherwise falls back to Qwen's
+    internal loss (V5 compat / Oracle mode where LoRA is frozen).
     """
     w = cfg.get("loss", {})
     lam_mask = w.get("mask_weight", 1.0)
@@ -125,10 +178,17 @@ def combined_loss(
     m_losses = mask_loss(logits_up, gt_masks, pad_mask,
                          ce_weight=ce_w, dice_weight=dice_w)
 
+    # V6 Proximity-Decayed LM loss (if available)
+    if qwen_logits is not None and labels is not None and lm_weights is not None:
+        l_lm = weighted_lm_loss(qwen_logits, labels, lm_weights)
+    else:
+        # Fallback: use Qwen's internal loss (Oracle/frozen LoRA mode)
+        l_lm = lm_loss if lm_loss is not None else torch.tensor(0.0)
+
     l_orth = orthogonal_regularization(model)
 
     total = (lam_mask * m_losses["mask_total"]
-             + lam_lm * lm_loss
+             + lam_lm * l_lm
              + lam_orth * l_orth)
 
     return {
@@ -136,6 +196,6 @@ def combined_loss(
         "mask_total": m_losses["mask_total"],
         "mask_ce": m_losses["mask_ce"],
         "mask_dice": m_losses["mask_dice"],
-        "lm_loss": lm_loss,
+        "lm_loss": l_lm,
         "orthogonal_reg": l_orth,
     }

@@ -5,24 +5,24 @@ model:
   qwen_dtype: "bfloat16"
   gradient_checkpointing: true
 
-  # V5 Qwen LoRA — lightweight, trained via [SEG]-only loss masking
+  # V6 Qwen LoRA — ultra-conservative LR to prevent Catastrophic Forgetting
   lora_r: 8
   lora_alpha: 16
   lora_dropout: 0.0
   lora_target_modules: ["q_proj", "v_proj"]
 
-  # V5 Bottleneck Projector (4096 → 512 → 256)
+  # Bottleneck Projector (4096 → 512 → 256, ~2.1M params)
   projector_hidden_dim: 512
 
-  # Differential LR: Qwen LoRA gets base_lr * qwen_lr_scale (conservative)
-  qwen_lr_scale: 0.2       # 1e-4 * 0.2 = 2e-5 for Qwen LoRA
+  # V6: Qwen LoRA at 1/100th of projector LR (V5 used 1/5th → caused collapse)
+  qwen_lr_scale: 0.01      # 1e-4 * 0.01 = 1e-6 for Qwen LoRA
 
   # SAM3
   sam3_checkpoint: null
   image_size: 1008
   sam3_lr_scale: 0.1
 
-  # SAM3 Orthogonal LoRA (frozen in Stage 1, unfrozen in Stage 2)
+  # SAM3 Orthogonal LoRA
   sam3_lora_r: 32
   sam3_lora_alpha: 64.0
   sam3_lora_n_singular: 32
@@ -48,21 +48,24 @@ training:
   checkpoint_dir: "checkpoints"
   save_every: 5
 
-# V5 Three-Stage Curriculum (Cold Start Protection)
+# V6 Three-Stage Curriculum
+# Stage 1 (ep1-5):  Projector warmup only — Qwen LoRA frozen
+# Stage 2 (ep6-10): + Qwen LoRA at 1e-6 (conservative co-adaptation)
+# Stage 3 (ep11+):  + SAM LoRA (full end-to-end)
 curriculum:
-  projector_warmup_epochs: 2    # Stage 1: only projector trains (Qwen LoRA frozen)
-  e2e_epoch: 5                  # Stage 3: SAM LoRA unfreezes for end-to-end
+  projector_warmup_epochs: 5
+  e2e_epoch: 10
 
 loss:
   mask_weight: 1.0
   ce_weight: 1.0
   dice_weight: 3.0
-  lm_weight: 0.1        # Minimal — only [SEG] token prediction (labels mask text)
+  lm_weight: 0.1               # V6: proximity-decayed weighted LM loss
   orthogonal_weight: 0.01
 
-# Monitoring & test evaluation
+# Monitoring
 monitor:
-  skip_sanity_check: true     # V5 uses live Qwen forward, not pre-computed GT embeds
+  skip_sanity_check: true
   log_dir: "checkpoints/logs"
   plot_dir: "checkpoints/plots"
   test_metadata: "/home/aviad/datasets/RWTD/metadata.json"

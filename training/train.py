@@ -150,19 +150,28 @@ def train_one_epoch(
         index_masks = batch["index_masks"].to(device)
         k_gts = batch["k_gts"].to(device)
 
-        # V5: Live Qwen forward with [SEG] token extraction.
-        # Labels already have -100 on text, CE only on [SEG] positions.
+        # V6: Live Qwen forward with [SEG] token extraction.
+        # seg_grad_to_lm=True when Qwen LoRA is unfrozen (Stages 2-3).
+        # In Stage 1 (warmup), gradients stop at projector.
+        grad_to_lm = phase in (2, 3)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model(
                 qwen_inputs=qwen_inputs,
                 sam_images=sam_images,
-                seg_grad_to_lm=True,  # mask gradients flow to Qwen LoRA
+                seg_grad_to_lm=grad_to_lm,
             )
 
             mask_logits = out["mask_logits"]
             k_preds = out["k_preds"]
             pad_mask = out["pad_mask"]
             lm_loss = out["lm_loss"]
+            qwen_logits = out.get("qwen_logits")
+
+            # V6: pass Qwen logits + per-token weights for proximity-decayed LM loss
+            batch_lm_weights = batch.get("lm_weights")
+            if batch_lm_weights is not None:
+                batch_lm_weights = batch_lm_weights.to(device)
+            batch_labels = qwen_inputs.get("labels")
 
             losses = combined_loss(
                 mask_logits=mask_logits,
@@ -172,6 +181,9 @@ def train_one_epoch(
                 lm_loss=lm_loss,
                 model=model,
                 cfg=effective_cfg,
+                qwen_logits=qwen_logits,
+                labels=batch_labels,
+                lm_weights=batch_lm_weights,
             )
 
             loss = losses["total"] / accum_steps

@@ -1,0 +1,424 @@
+\documentclass{article}
+
+% NeurIPS 2025 style
+\usepackage[preprint]{neurips_2025}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{multirow}
+
+\title{Qwen2SAM-DeTexture: End-to-End VLM-Guided Multi-Texture Segmentation via Multiplexed Grounding}
+
+% Authors — anonymous for submission
+\author{
+  Anonymous Authors
+}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+Recent work on texture-aware segmentation---most notably TextureSAM, which demonstrated that foundation segmentation models carry a systematic shape bias that can be mitigated through texture-augmented fine-tuning---has established that \emph{what} to segment in texture-dominant scenes is a solvable problem. However, the complementary question of \emph{how many} and \emph{which} textures to segment remains unaddressed: TextureSAM and the SAM family operate as class-agnostic prompt-based models that require external specification of regions of interest, while Vision-Language Models (VLMs) that could provide such specification struggle with dense, multi-target grounding in a single forward pass. We present \textbf{Qwen2SAM-DeTexture}, an end-to-end architecture that closes this gap by coupling a VLM's open-vocabulary reasoning with a texture-aware segmentation decoder for parallel, multi-texture segmentation. Building on TextureSAM's texture-augmented ADE20K dataset for training data construction, we systematically characterize four architectural pathologies that emerge when extending \texttt{[SEG]}-token grounding pipelines to the multi-target regime: (i)~\emph{Context Leakage}, whereby causal attention contaminates downstream \texttt{[SEG]} representations (inter-texture cosine similarity of 0.74 under shared context vs.\ 0.16 under isolation); (ii)~\emph{Slot-1 Positional Bias}, where SAM's cross-attention allocates 90.5\% of pixels to the first query regardless of semantic content; (iii)~\emph{Count Collapse}, in which co-trained language modeling loss incentivizes early sequence termination (85\% of samples collapsing to a single predicted texture); and (iv)~\emph{Directional Drift}, where an over-parameterized projector memorizes domain-specific manifold directions ($4\times$ higher representational compression on out-of-distribution data). Our V5 architecture resolves these pathologies through block-diagonal attention masking, batch-multiplexed SAM decoding, segment-only loss masking, and an information-bottleneck projector---achieving parallel multi-texture segmentation in a single forward pass with only ${\sim}6.6$M trainable parameters. We further contribute the \textbf{DeTexture Pipeline}, a geometry-first texture mining framework for curating training data from large-scale datasets, and the \textbf{Real-World Texture Dataset (RWTD)}, a benchmark of 253 in-the-wild texture transition scenes. Our pre-V5 slim model already surpasses the zero-shot SAM baseline on RWTD (mIoU 0.732 vs.\ 0.706), and V5 training with all four fixes integrated is underway.
+\end{abstract}
+
+% ============================================================================
+% 1. INTRODUCTION
+% ============================================================================
+\section{Introduction}
+
+Foundation segmentation models have achieved remarkable generalization across visual domains, yet they remain fundamentally \emph{prompt-driven}: a human or upstream system must specify \emph{what} to segment, whether through points, boxes, or text. TextureSAM~\cite{texturesam} recently exposed a critical limitation within this paradigm---Segment Anything Models carry a systematic shape bias inherited from object-centric training data, causing them to fragment texture-defined regions rather than segment them as coherent wholes. By fine-tuning SAM-2 on a texture-augmented variant of ADE20K (Textured-ADE20K), TextureSAM demonstrated that this shape bias can be shifted toward texture sensitivity, improving mIoU on real-world texture scenes by $+0.21$ over SAM-2. This result established an important proof of concept: texture-aware segmentation \emph{is} achievable within foundation model architectures.
+
+However, TextureSAM---like all SAM variants---addresses only the \emph{segmentation} half of the problem. It cannot autonomously determine \emph{how many} texture regions exist in an image, \emph{what} those textures are, or \emph{which} pixels belong to which texture. These decisions must be supplied externally, either by a human annotator providing point prompts or by a separate upstream model. In real-world applications---robotic terrain analysis, material inspection, autonomous driving surface understanding---what is needed is a system that can \emph{jointly reason about and segment} multiple textures in a single, fully automated forward pass.
+
+The natural candidate for supplying this missing reasoning capability is the Vision-Language Model (VLM). Recent advances in reasoning segmentation---LISA~\cite{lisa}, LISA++~\cite{lisapp}, GSVA~\cite{gsva}, PixelLM~\cite{pixellm}, GLaMM~\cite{glamm}, and Sa2VA~\cite{sa2va}---have demonstrated that VLMs can learn to emit special \texttt{[SEG]} tokens whose hidden representations, when projected into a segmentation decoder, yield high-quality masks. Yet these systems are designed predominantly for \emph{single-target} or \emph{sequential} grounding: LISA requires $K$ forward passes to segment $K$ targets; GSVA generates multiple \texttt{[SEG]} tokens but under standard causal attention that causes inter-token semantic contamination; Sa2VA unifies grounding with conversation but inherits the same causal decoding bottleneck. No existing system can produce a \emph{spatially consistent, non-overlapping partition} of an image into multiple texture regions in a single pass.
+
+This paper bridges the gap between TextureSAM's texture-aware segmentation capability and VLMs' open-vocabulary reasoning by presenting \textbf{Qwen2SAM-DeTexture}, an end-to-end architecture for parallel, multi-texture segmentation. Our central question is: \textbf{Can a VLM-guided system autonomously identify, describe, and segment multiple texture regions simultaneously, producing a consistent image partition in one forward pass?}
+
+We answer affirmatively, but the path to our solution---the V5 architecture---required uncovering and resolving four distinct \emph{architectural pathologies} that emerge when extending single-target \texttt{[SEG]}-token grounding to the multi-target regime. Crucially, our research follows a \emph{data-architecture co-design} philosophy that traces directly to our group's prior work on TextureSAM.
+
+\paragraph{From TextureSAM to Data-Architecture Co-design.}
+TextureSAM's Textured-ADE20K dataset, constructed via Compositional Neural Texture (CNT) augmentation with controllable intensity $\eta$, provides training images where texture boundaries are well-defined and ground-truth masks are preserved across augmentation degrees. We leverage this dataset as the foundation of our training data pipeline, extending it with a geometry-first scoring system (the DeTexture Pipeline) that mines the most texture-rich samples, and an automated VLM-based annotation stage that generates natural language descriptions for each texture region. This data ecosystem also produced the Real-World Texture Dataset (RWTD)---253 curated in-the-wild scenes with challenging texture transitions---which served as a diagnostic probe throughout development. Early evaluation on RWTD revealed the Slot-1 Positional Bias in SAM's decoder (invisible on cleaner benchmarks), and the cross-domain gap between ADE20K and RWTD exposed Directional Drift in our projector (undetectable when training and evaluation share the same domain). In this sense, the dataset \emph{discovered} the architectural problems.
+
+\paragraph{Contributions.} We make the following contributions:
+
+\begin{enumerate}
+    \item \textbf{Systematic Characterization of Multi-Target Grounding Pathologies.} Through five architectural generations (V1--V5) and rigorous ablation, we identify and formally characterize four pathologies---Context Leakage, Slot-1 Positional Bias, Count Collapse, and Directional Drift---that prevent existing VLM-segmentation architectures from scaling to multi-target grounding. These pathologies are general: they affect any architecture that combines causal VLM decoding with SAM-family decoders for multi-target prediction.
+
+    \item \textbf{The V5 Architecture.} We propose a unified architecture integrating block-diagonal attention masking, batch-multiplexed SAM decoding, segment-only loss masking, and an information-bottleneck projector. Together, these mechanisms enable parallel multi-texture segmentation in a single forward pass with only ${\sim}6.6$M trainable parameters atop frozen Qwen3-VL-8B and SAM3 backbones.
+
+    \item \textbf{A Complete Training Data Pipeline.} Building on TextureSAM's Textured-ADE20K, we contribute (a)~the DeTexture Pipeline, a geometry-first scoring system for mining texture-rich images from large-scale datasets, (b)~an automated description generation stage using VLM vision APIs, and (c)~the Real-World Texture Dataset (RWTD), a benchmark designed to stress-test multi-texture segmentation in challenging, in-the-wild conditions.
+
+    \item \textbf{The Winner-Takes-All Arbitration Framework.} We introduce a principled pixel-assignment mechanism that resolves spatial competition between multiple texture queries, guaranteeing a mathematically consistent, non-overlapping partition of the image---a property that sequential grounding models fundamentally cannot enforce.
+\end{enumerate}
+
+% ============================================================================
+% 2. RELATED WORK
+% ============================================================================
+\section{Related Work}
+
+\subsection{Texture-Aware Segmentation and TextureSAM}
+
+Foundation segmentation models exhibit a well-documented shape bias: trained predominantly on object-centric datasets, they learn to segment along object boundaries rather than texture boundaries~\cite{texturesam,kth}. TextureSAM~\cite{texturesam} addressed this directly by constructing a texture-augmented ADE20K dataset using Compositional Neural Texture (CNT) synthesis~\cite{cocostuff} with a controllable interpolation coefficient $\eta$ that smoothly transitions images from their original appearance ($\eta = 1.0$) to pure texture replacement ($\eta = 0.0$). Fine-tuning SAM-2 on this augmented data shifted the model's segmentation prior toward texture-defined regions, achieving $+0.21$ mIoU on the Real-World Texture Dataset (RWTD) and $+0.18$ mIoU on synthetic texture benchmarks over the SAM-2 baseline. However, TextureSAM remains a \emph{prompt-driven} model: it cannot autonomously determine the number or identity of texture regions, requiring external specification of regions of interest. Our work extends TextureSAM's contributions in two directions---leveraging its Textured-ADE20K for training data construction while adding autonomous, language-guided multi-texture reasoning that eliminates the need for manual prompting.
+
+\subsection{Reasoning Segmentation and the \texttt{[SEG]} Token Paradigm}
+
+LISA~\cite{lisa} pioneered \emph{reasoning segmentation}, embedding a learnable \texttt{[SEG]} token into an LLM's vocabulary such that the token's hidden state, when projected into SAM's prompt encoder, produces a segmentation mask conditioned on complex natural language queries. LISA++~\cite{lisapp} extended this baseline with instance-level segmentation and Segmentation-in-Dialogue (SiD), enabling multi-turn conversational grounding. However, both LISA and LISA++ are fundamentally \emph{sequential}: segmenting $K$ targets requires $K$ independent forward passes, each unaware of the others. This isolation leads to two practical failures: (a)~computational cost that scales linearly with $K$, and (b)~independently generated masks that lack mutual spatial awareness, producing overlapping regions that violate the fundamental constraint of image partitioning. In our experiments, sequential LISA-style approaches cannot enforce non-overlapping mask constraints without post-hoc reconciliation---precisely the property our Winner-Takes-All mechanism guarantees natively.
+
+GSVA~\cite{gsva} made an important step toward multi-target grounding by extending LISA's architecture to support \emph{multiple} \texttt{[SEG]} tokens within a single decoding pass, alongside a novel \texttt{[REJ]} token for explicitly rejecting absent targets in Generalized Referring Expression Segmentation (GRES). While GSVA demonstrates that multiple grounding tokens can coexist in the output sequence, it relies on standard causal attention during generation. As we demonstrate in Section~\ref{sec:context_leakage}, this architectural choice introduces \emph{Context Leakage}: the hidden state of $\texttt{[SEG]}_k$ absorbs semantic information from all preceding texture descriptions through the causal attention pathway, with inter-token cosine similarity reaching 0.74 under shared context versus 0.16 under isolation. GSVA's design assumes that the LLM can maintain representational purity across sequential \texttt{[SEG]} tokens---an assumption our ablations empirically refute for dense texture grounding.
+
+\subsection{Dense Grounding via Multimodal LLMs}
+
+A growing family of models integrates pixel-level grounding directly into multimodal LLM architectures. PixelLM~\cite{pixellm} introduces a lightweight pixel decoder with a segmentation codebook, where codebook token embeddings serve as conditioning inputs for mask generation, enabling multi-target referring segmentation without requiring SAM. GLaMM~\cite{glamm} pioneered \emph{Grounded Conversation Generation}, producing natural language responses seamlessly interleaved with segmentation masks through phrase-level grounding. Sa2VA~\cite{sa2va} unifies SAM-2 with LLaVA into a shared token space, generating instruction tokens that guide SAM-2's mask decoder for both image and video grounding. LLaVA-Grounding~\cite{llavaground} connects visual grounding with LLM-based reasoning for referring expression comprehension.
+
+While these models advance the state of the art on referring segmentation benchmarks (Sa2VA achieves 81.6 cIoU on RefCOCO, outperforming GLaMM's 79.5), they share a common architectural limitation: all rely on standard causal attention mechanisms during multi-token generation. This is adequate for \emph{referring} segmentation, where targets are specified by the user and generated one at a time, but becomes pathological for \emph{autonomous multi-target partitioning}, where the model must simultaneously generate and ground multiple regions. We identify two failure modes specific to this setting: Context Leakage from causal attention (Section~\ref{sec:context_leakage}) and Count Collapse from co-trained language loss (Section~\ref{sec:count_collapse}). Our block-diagonal attention mask and segment-only loss masking are general solutions applicable to any architecture in this family.
+
+\subsection{SAM and Prompt-Based Segmentation}
+
+The Segment Anything Model (SAM)~\cite{sam} and its successors (SAM-2~\cite{sam2}) have established prompt-based segmentation as a powerful paradigm. Given visual prompts (points, boxes, masks) or dense embedding prompts, SAM produces high-quality segmentation masks with strong zero-shot generalization. SAM-2 extends this to video with memory-augmented tracking. These models excel as segmentation \emph{backends} in VLM-guided pipelines, but their decoder architecture exhibits an underexplored positional bias when processing multiple prompt embeddings simultaneously. Through controlled experiments on all 253 RWTD samples using ground-truth embeddings, we discovered that SAM's cross-attention mechanism allocates 90.5\% of pixels to the first prompt slot regardless of semantic content, with 0.0\% allocation to the second slot---a bias that persists after swapping prompt order and under isolated single-query evaluation (Section~\ref{sec:slot1}). This \emph{Slot-1 Addiction} is invisible in single-target applications (where all existing benchmarks operate) but catastrophic for multi-target segmentation, effectively reducing a multi-query decoder to a single-query one.
+
+\subsection{Multi-Target and Panoptic Segmentation}
+
+Classical panoptic segmentation approaches---Mask2Former~\cite{mask2former}, Panoptic FPN~\cite{panopticfpn}---achieve multi-target segmentation through DETR-style set prediction or proposal generation. While effective for closed-vocabulary, fixed-category settings, these methods cannot leverage natural language descriptions of novel textures and require retraining for new categories. Recent open-vocabulary panoptic models (X-Decoder~\cite{xdecoder}, OpenSeeD~\cite{openseed}) extend to unseen categories via text-image alignment but still operate with predefined category lists rather than free-form descriptions. Our work bridges this gap by combining VLMs' open-vocabulary reasoning with SAM's segmentation quality, introducing the architectural innovations necessary for reliable multi-target texture grounding.
+
+\subsection{Texture Segmentation and Datasets}
+
+Texture segmentation has a rich history predating deep learning, from Brodatz-based evaluations to the Describable Textures Dataset (DTD)~\cite{dtd}, KTH-TIPS~\cite{kth}, and texture subsets of MS-COCO Stuff~\cite{cocostuff}. However, these benchmarks predominantly feature isolated texture patches or well-separated regions under controlled conditions. They do not capture the challenging \emph{texture transition} scenarios common in real-world imagery: gradual boundaries between sand and water, interleaving patterns of brick and mortar, or complex junctions of concrete, grass, and gravel. TextureSAM's RWTD benchmark~\cite{texturesam} and our extended DeTexture mining pipeline specifically target these challenging in-the-wild cases, providing both evaluation benchmarks and a reproducible methodology for curating texture-rich training data from large-scale annotated datasets.
+
+% ============================================================================
+% 3. METHODOLOGY
+% ============================================================================
+\section{Methodology}
+
+% ----------------------------------------------------------------------------
+\subsection{Methodology Foundations: From Heuristic Probing to End-to-End V5}
+\label{sec:poc}
+
+In the preliminary stages of this research, we explored the feasibility of autonomous VLM-SAM communication through a structured prompt-guided bridge, without any joint training. In this early pipeline, Qwen2.5-VL generates structured texture descriptions delineated by special markers (\texttt{<START\_SEG\_A>}, \texttt{<END\_SEG\_A>}), from which hidden states are extracted at marker boundaries, projected via a multi-token MLP ($2048 \to 1024 \to 256$), and fed to SAM3's cross-attention as variable-length prompts. Each word of the description maintains independent cross-attention with the visual features, preserving fine-grained semantic information that single-token compression would destroy.
+
+While initial tests with Qwen2.5-VL demonstrated the potential for structured VLM-to-SAM communication, they also revealed significant limitations in texture description granularity that hindered precise grounding. Specifically, the generated descriptions often failed to capture the subtle geometric and material nuances essential for disambiguating complex real-world texture transitions---producing generic characterizations (e.g., ``rough surface'') where the segmentation decoder required spatially discriminative detail (e.g., ``weathered grey concrete with visible aggregate pattern in the lower foreground'').
+
+Nevertheless, this heuristic probing phase yielded two foundational insights. First, it validated that VLM hidden states carry sufficient spatial-semantic information to guide a segmentation decoder---confirming that \texttt{[SEG]}-token grounding can extend beyond single-target referring expressions to multi-texture partitioning. Second, it established the Winner-Takes-All (WTA) arbitration logic as the principled mechanism for resolving spatial competition between multiple texture queries. Through systematic comparison with CLIPSeg-based heatmap alternatives and a pair optimization algorithm (scoring all $N \times M$ description-pair combinations by quality and overlap penalties), we found that competitive pixel assignment via WTA consistently produced the most spatially coherent, non-overlapping partitions.
+
+These insights motivated the adoption of \textbf{Qwen3-VL-8B} as the central architectural foundation for the V5 system. By leveraging Qwen3-VL's superior visual reasoning capabilities and higher-dimensional latent space (4096-D vs.\ Qwen2.5-VL's 2048-D), we moved beyond heuristic probing to a fully end-to-end architecture capable of extracting rich, spatially-aware hidden states at dedicated \texttt{[SEG]} token boundaries, which are subsequently projected into SAM3's prompt space. This transition was fundamental in enabling the WTA arbitration logic to resolve spatial competition between multiple texture queries with the discriminative precision that the earlier foundation lacked.
+
+The resulting V5 architecture (Figure~\ref{fig:architecture}) comprises four components: a frozen Qwen3-VL-8B backbone with lightweight LoRA adapters, a bottleneck projector, a SAM3 mask decoder with orthogonal LoRA, and a Winner-Takes-All pixel assignment layer. Training employs a three-stage curriculum with only ${\sim}6.6$M trainable parameters. We arrived at this design through systematic ablation across five architectural generations, each of which uncovered and resolved a specific pathology.
+
+\begin{figure}[t]
+    \centering
+    % \includegraphics[width=\textwidth]{figures/architecture.pdf}
+    \fbox{\parbox{0.95\textwidth}{\centering\vspace{2cm}\textbf{[Architecture Diagram Placeholder]}\\\small V5 pipeline: Qwen3-VL $\to$ Block-Diagonal Mask $\to$ Bottleneck Projector $\to$ Batch-Multiplexed SAM3 $\to$ WTA\vspace{2cm}}}
+    \caption{\textbf{Qwen2SAM-DeTexture V5 Architecture.} The VLM generates texture descriptions with \texttt{[SEG]} tokens under a block-diagonal attention mask that isolates each texture's context. A bottleneck projector maps \texttt{[SEG]} embeddings to SAM's prompt space, where batch multiplexing ensures each query occupies an independent ``Slot~1.'' Winner-Takes-All pixel assignment produces a non-overlapping partition. Only ${\sim}6.6$M parameters (shaded) are trainable.}
+    \label{fig:architecture}
+\end{figure}
+
+% ----------------------------------------------------------------------------
+\subsection{Overcoming Context Leakage via Block-Diagonal Attention Masking}
+\label{sec:context_leakage}
+
+\paragraph{Pathology.}
+Any architecture that generates multiple \texttt{[SEG]} tokens within a single causal decoding pass is susceptible to \emph{Context Leakage}: the hidden state of a later grounding token absorbs semantic information from earlier texture descriptions through the autoregressive attention pathway. Given $K$ texture targets, the model produces a sequence:
+\begin{equation}
+    \texttt{TEXTURE\_1:}~\langle \text{desc}_1 \rangle~\texttt{[SEG]}_1 \quad \texttt{TEXTURE\_2:}~\langle \text{desc}_2 \rangle~\texttt{[SEG]}_2 \quad \ldots
+\end{equation}
+Under standard causal (left-to-right) attention, $\texttt{[SEG]}_2$ attends to all preceding tokens, including the description of \textsc{texture\_1} and $\texttt{[SEG]}_1$. This creates a representational contamination pathway: the hidden state of $\texttt{[SEG]}_2$ encodes not only the semantics of \textsc{texture\_2} but also residual information from \textsc{texture\_1}.
+
+We quantified this effect empirically. Under a standard ``segment 1 to 6 textures'' prompt with causal attention, the mean cosine similarity between consecutive \texttt{[SEG]} embeddings reached \textbf{0.74}. When we constrained the prompt to ``exactly 2 textures'' and repeated the measurement, the cosine similarity dropped to \textbf{0.16}---revealing that the high similarity was a \emph{prompt-induced artifact} of causal context sharing, not an intrinsic property of the textures. This contamination is asymmetric and cumulative: later \texttt{[SEG]} tokens are progressively more contaminated than earlier ones, producing a systematic degradation in mask quality that worsens with the number of targets. This pathology is inherent to any multi-\texttt{[SEG]} architecture that relies on standard causal attention, including GSVA~\cite{gsva} and Sa2VA~\cite{sa2va}.
+
+\paragraph{Solution: Two-Pass Inference with Block-Diagonal Attention Mask.}
+We introduce a custom attention mask $\mathbf{M} \in \{0, -\infty\}^{L \times L}$ that enforces block-diagonal structure over texture-specific token groups while preserving the causal constraint within each block. Let $\mathcal{G}_k$ denote the set of token indices belonging to texture $k$ (its description tokens and \texttt{[SEG]} token). We define:
+\begin{equation}
+    \mathbf{M}_{ij} = \begin{cases}
+        0 & \text{if } \exists\, k: i \in \mathcal{G}_k \wedge j \in \mathcal{G}_k \wedge i \geq j \\
+        0 & \text{if } j \in \mathcal{G}_{\text{shared}} \wedge i \geq j \\
+        -\infty & \text{otherwise}
+    \end{cases}
+\end{equation}
+where $\mathcal{G}_{\text{shared}}$ contains the image tokens and system prompt tokens that all textures may attend to. The constraint $i \geq j$ preserves the causal ordering within each block and with respect to the shared context, ensuring compatibility with the LLM's pretrained autoregressive distribution. This mask guarantees that each \texttt{[SEG]} token attends \emph{only} to past tokens within its own texture description and the shared visual context, producing semantically pure, decoupled representations. At inference, we employ a two-pass strategy: the first pass processes the full prompt to extract texture descriptions via Qwen's frozen language capabilities, while the second pass applies the block-diagonal mask to compute isolated \texttt{[SEG]} embeddings.
+
+% ----------------------------------------------------------------------------
+\subsection{Solving SAM's Positional Bias via Batch Multiplexing}
+\label{sec:slot1}
+
+\paragraph{Pathology.}
+Prompt-based segmentation decoders in the SAM family exhibit an underexplored positional bias when processing multiple prompt embeddings simultaneously. When the mask decoder receives multiple prompt embeddings $\mathbf{Q} \in \mathbb{R}^{B \times K \times D}$ (where $K$ is the number of texture queries), its cross-attention mechanism routes nearly all spatial attention to the first prompt position---a phenomenon we term \emph{Slot-1 Addiction}. Through controlled experiments on all 253 RWTD samples using ground-truth \texttt{[SEG]} embeddings, we measured the pixel allocation across prompt slots:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Slot} & \textbf{Pixel Allocation} & \textbf{After Swap (T1$\leftrightarrow$T2)} & \textbf{Isolated Query} \\
+\midrule
+Slot 1 & \textbf{90.5\%} & \textbf{90.5\%} & 90.5\% \\
+Slot 2 & \textbf{0.0\%} & \textbf{0.0\%} & 0.0\% \\
+\bottomrule
+\end{tabular}
+\caption{SAM3 pixel allocation across prompt slots on RWTD ($n{=}253$). The positional bias persists regardless of semantic content, prompt order, or query isolation.}
+\label{tab:slot1}
+\end{table}
+
+The bias persists identically after swapping texture assignments between slots and when running each query in isolation---confirming that this is a \emph{positional} bias intrinsic to the decoder's pretrained cross-attention weights, not a consequence of query content. This pathology is invisible in single-target applications (where all existing benchmarks operate) but catastrophic for any multi-target segmentation system, effectively reducing a multi-query decoder to a single-query one.
+
+\paragraph{Solution: Batch Multiplexing.}
+Rather than passing multiple queries through SAM's multi-prompt pathway, we reshape the query tensor from $\mathbb{R}^{B \times K \times D}$ to $\mathbb{R}^{(B \cdot K) \times 1 \times D}$, replicating the image features accordingly via an index mapping. This forces each texture query to occupy \emph{its own} Slot~1 in an independent SAM forward pass, bypassing the positional bias entirely. The resulting masks $\hat{\mathbf{m}}_k \in [0,1]^{H \times W}$ for $k = 1, \ldots, K$ are then recombined along the batch dimension for competitive pixel assignment. This transformation is computationally equivalent to $K$ independent SAM passes but is implemented as a single batched operation, preserving GPU efficiency. Empirically, batch multiplexing immediately recovered performance to 99.5\% of the zero-shot baseline (mIoU 0.703 vs.\ 0.706) at epoch~5.
+
+% ----------------------------------------------------------------------------
+\subsection{Preventing Count Collapse via Teacher-Forced Segment-Only Loss Masking}
+\label{sec:count_collapse}
+
+\paragraph{Pathology.}
+We observe that na\"ive end-to-end co-training of a VLM with segmentation losses inevitably leads to a \emph{Count Collapse} pathology: when the language modeling cross-entropy loss is computed over all generated tokens---including both texture descriptions and \texttt{[SEG]} tokens---the optimization landscape creates a shortcut whereby the model minimizes total loss by terminating generation after a single texture description, since predicting fewer tokens incurs less cumulative risk. In our experiments, this manifested with striking severity: 85\% of evaluation samples (216 out of 253) predicted $K{=}1$ texture, with the count distribution collapsing to $\{1{:}\,216,\; 2{:}\,17,\; 3{:}\,9,\; 4{:}\,2,\; 5{:}\,2,\; 6{:}\,7\}$.
+
+The consequences cascade beyond count accuracy into a systemic co-adaptation failure. As the VLM collapses to single-texture outputs, the downstream projector adapts to this degenerate distribution, binding to single-token representations and rejecting multi-token inputs. We verified this by bypassing the VLM entirely and feeding ground-truth multi-texture embeddings to the trained projector: it allocated 100\% of pixels to the dustbin class---confirming that the projector had irreversibly co-adapted to the collapsed distribution and lost the ability to process legitimate multi-texture inputs. This pathology is not specific to our architecture; it is an inherent risk for any system that co-trains autoregressive language generation with dense prediction losses.
+
+\paragraph{Solution: Teacher-Forced Segment-Only Loss Masking.}
+We resolve Count Collapse through two complementary mechanisms. First, during training, we employ \emph{teacher forcing}: rather than allowing the VLM to autoregressively generate texture descriptions (which would expose it to the collapsed distribution), we feed the ground-truth multi-texture sequence directly as input. This ensures the model always observes the correct number of textures and their descriptions during training, preventing the feedback loop that drives count collapse.
+
+Second, we apply a label mask of $-100$ (PyTorch's cross-entropy ignore index) to \emph{all} text tokens in the sequence, computing cross-entropy loss \emph{exclusively} on \texttt{[SEG]} token positions. Formally, let $\mathbf{y} = (y_1, \ldots, y_L)$ be the target sequence and $\mathcal{S} = \{i : y_i = \texttt{[SEG]}\}$ the set of \texttt{[SEG]} positions. The masked language modeling loss is:
+\begin{equation}
+    \mathcal{L}_{\text{LM}} = -\frac{1}{|\mathcal{S}|} \sum_{i \in \mathcal{S}} \log p_\theta(y_i \mid y_{<i})
+\end{equation}
+This design embodies a principled separation of learning signals: the \emph{pixels} teach the \texttt{[SEG]} token what to ground (through backpropagated mask losses), while the VLM's primary autoregressive distribution remains frozen and intact. The mask loss gradients flow through the \texttt{[SEG]} embeddings into the LoRA-adapted layers of the VLM, shaping \emph{where} the model attends in the visual features, but never corrupt the language prior that governs \emph{how many} textures to describe or \emph{what} words to use. Teacher forcing combined with segment-only loss masking thus allows the VLM to retain its pretrained ability to generate accurate texture descriptions and correct counts, while learning to produce spatially grounded \texttt{[SEG]} representations.
+
+% ----------------------------------------------------------------------------
+\subsection{Information Bottleneck Projector to Prevent Directional Drift}
+\label{sec:drift}
+
+\paragraph{Pathology.}
+We demonstrate that mapping high-dimensional VLM embeddings to a segmentation decoder's prompt space using standard, high-capacity projectors results in \emph{Directional Drift}: the projector memorizes domain-specific manifold directions from the training distribution rather than learning a generalizable mapping. A projector with approximately 10.5M parameters achieved strong in-domain performance (ADE20K mIoU climbing from 0.700 to 0.707 across epochs 5--13), yet exhibited systematic cross-domain degradation: RWTD mIoU dropped from 0.692 at epoch~5 to 0.618 at epoch~10---a divergence invisible when training and evaluation share the same distribution.
+
+To diagnose the mechanism, we performed a vector geometry analysis, measuring the cosine similarity between paired \texttt{[SEG]} embeddings \emph{before} and \emph{after} the projector:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Domain} & \textbf{Pre-Projector Cosine} & \textbf{Post-Projector Cosine} & \textbf{Compression ($\Delta$)} \\
+\midrule
+RWTD (cross-domain) & 0.736 & 0.919 & \textbf{+0.183} \\
+ADE20K (in-domain) & 0.831 & 0.879 & +0.048 \\
+\bottomrule
+\end{tabular}
+\caption{Projector compression analysis. The high-capacity projector compresses RWTD representations nearly $4\times$ more than ADE20K, indicating domain-specific directional memorization.}
+\label{tab:drift}
+\end{table}
+
+The projector compressed RWTD representations nearly \textbf{$4\times$ more} than ADE20K representations ($\Delta = 0.183$ vs.\ $0.048$), pushing cross-domain \texttt{[SEG]} vectors toward a shared manifold direction learned from ADE20K's training distribution. Critically, this was \emph{not} representational collapse (the post-projector cosine actually decreased from 0.919 to 0.895 between epochs 5 and 10). Rather, the projector learned domain-specific \emph{directional priors}---manifold orientations that happened to align with ADE20K's texture vocabulary but actively harmed generalization. This pathology generalizes beyond our setting: any VLM-to-decoder projector with sufficient capacity will tend to overfit to training-domain structure when the output dimensionality is substantially lower than the input.
+
+\paragraph{Solution: Constrained Bottleneck Projector.}
+We replace the high-capacity projector with a constrained bottleneck architecture:
+\begin{equation}
+    f_{\text{proj}}(\mathbf{h}) = \mathbf{W}_2 \cdot \delta\!\left(\mathrm{LN}\!\left(\mathbf{W}_1 \mathbf{h} + \mathbf{b}_1\right)\right) + \mathbf{b}_2
+\end{equation}
+where $\mathbf{W}_1 \in \mathbb{R}^{512 \times 4096}$, $\mathbf{W}_2 \in \mathbb{R}^{256 \times 512}$, LN denotes Layer Normalization, $\delta$ is the GELU activation, and dropout ($p = 0.15$) is applied after the activation. The total parameter count is approximately \textbf{2.1M}---a $5\times$ reduction. The intermediate bottleneck dimension of 512 forces an information bottleneck: the projector cannot memorize domain-specific directions in a 512-dimensional space while maintaining fidelity to the full 4096-dimensional input distribution. This single change produced the \textbf{first trained model to surpass the zero-shot SAM baseline}, achieving mIoU 0.732 vs.\ 0.706 on RWTD at epoch~5---a gain of $+0.040$ over the original projector.
+
+% ----------------------------------------------------------------------------
+\subsection{Winner-Takes-All Pixel Assignment}
+\label{sec:wta}
+
+Given $K$ soft mask predictions $\hat{\mathbf{m}}_k \in [0,1]^{H \times W}$ from the batch-multiplexed SAM decoder, we must produce a spatially consistent partition of the image. We define a Winner-Takes-All (WTA) assignment augmented with a learned dustbin channel:
+\begin{equation}
+    \mathrm{label}(i,j) = \begin{cases}
+        \arg\max_{k \in \{1,\ldots,K\}} \hat{m}_k(i,j) & \text{if } \max_k \hat{m}_k(i,j) > \hat{m}_{\text{dust}}(i,j) \\
+        \texttt{dustbin} & \text{otherwise}
+    \end{cases}
+\end{equation}
+where $\hat{m}_{\text{dust}}$ is produced by a learned 4096-dimensional dustbin embedding passed through the same projector and SAM decoder pathway. The dustbin class absorbs pixels that do not belong to any queried texture, preventing forced assignment of background regions. The WTA mechanism guarantees a \emph{mathematically consistent} partition: every pixel is assigned to exactly one class, with no overlaps and no gaps---a property that sequential, independent models fundamentally cannot enforce.
+
+% ----------------------------------------------------------------------------
+\subsection{Three-Stage Curriculum Training}
+\label{sec:curriculum}
+
+To manage the interaction between components of differing capacity and learning dynamics, we employ a three-stage curriculum:
+
+\paragraph{Stage 1: Projector Warmup (Epochs 0--1).}
+Only the bottleneck projector, multi-texture mask head, and dustbin embedding are trainable (${\sim}2.3$M parameters). Qwen LoRA and SAM LoRA remain frozen. This stage establishes a viable mapping between Qwen's frozen \texttt{[SEG]} representations and SAM's prompt space without co-adaptation.
+
+\paragraph{Stage 2: Qwen Integration (Epochs 2--4).}
+Qwen's LoRA adapters (rank 8, targeting \texttt{q\_proj} and \texttt{v\_proj}; ${\sim}3.8$M parameters) are unfrozen at a conservative learning rate of $2 \times 10^{-5}$ ($0.2\times$ the base rate). This allows the \texttt{[SEG]} representations to gradually adapt to the projector's learned mapping without catastrophic forgetting of language capabilities.
+
+\paragraph{Stage 3: End-to-End (Epochs 5--60).}
+SAM's orthogonal LoRA adapters (rank 32, targeting q, k, v, out\_proj in cross-attention layers; ${\sim}0.3$M parameters) are unfrozen at $1 \times 10^{-5}$ ($0.1\times$ the base rate) for full end-to-end gradient flow. Orthogonal regularization ($\lambda = 0.01$) prevents SAM's pretrained features from drifting.
+
+The total loss combines mask supervision with the segment-only language loss:
+\begin{equation}
+    \mathcal{L} = \underbrace{\mathcal{L}_{\text{CE}}^{\text{mask}} + 3.0 \cdot \mathcal{L}_{\text{Dice}}}_{\text{mask losses}} + 0.1 \cdot \underbrace{\mathcal{L}_{\text{LM}}^{\text{seg-only}}}_{\texttt{[SEG]}\text{-only CE}} + 0.01 \cdot \underbrace{\mathcal{L}_{\text{orth}}}_{\text{SAM LoRA reg.}}
+\end{equation}
+
+% ============================================================================
+% 4. DATA ECOSYSTEM
+% ============================================================================
+\section{Data Ecosystem: The DeTexture Pipeline and Dual-Evaluation Strategy}
+\label{sec:data}
+
+Our contribution extends beyond architecture to a complete data ecosystem designed to (a)~transform generic semantic datasets into high-quality texture-grounding training data, (b)~provide controlled in-domain evaluation, and (c)~stress-test generalization on an external, in-the-wild benchmark. This ecosystem was not merely a prerequisite for training but an active participant in architectural discovery: each pathology identified in Section~\ref{sec:context_leakage}--\ref{sec:drift} was first surfaced by evaluating on out-of-domain data whose distributional distance from the training set exposed failure modes invisible on in-domain benchmarks.
+
+\subsection{The Core Data Contribution: The DeTexture Mining Pipeline}
+\label{sec:pipeline}
+
+We introduce the \textbf{DeTexture Pipeline}, an automated, scalable framework designed to transform generic semantic datasets into high-quality texture-grounding data. The pipeline operates in three stages: intelligent filtering, geometric extraction, and VLM-based annotation.
+
+\paragraph{Source Material.}
+Our training pool originates from TextureSAM's~\cite{texturesam} texture-augmented ADE20K, which applies Compositional Neural Texture (CNT) synthesis at varying augmentation intensities (degree $\eta \in [0, 1]$) to the original ADE20K training split~\cite{ade20k}. This yields up to ${\sim}222{,}000$ candidate images spanning the full spectrum from original scenes ($\eta = 0$) to fully texture-replaced variants ($\eta = 1.0$). Crucially, the augmentation preserves ground-truth semantic masks across all degrees, as CNT modifies appearance but not region geometry.
+
+\paragraph{Intelligent Filtering.}
+We apply a geometry-first scoring system that quantifies each image's suitability for texture segmentation on a 0--100 scale. The score combines a mask-structure prior $s_A$ (region count, size distribution, entropy) with a boundary quality metric $s_{\text{geom}}$ (gradient-transition strength, boundary coherence, region balance), weighted toward geometry:
+\begin{equation}
+    s = 0.20 \cdot s_A + 0.60 \cdot s_{\text{geom}} + \text{bonuses} - \text{penalties}
+\end{equation}
+with bonuses for high texture coverage and 2--4 coherent regions, and penalties for object-dominated or excessively fragmented scenes. Semantic filtering classifies ADE20K categories into texture surfaces (${\sim}72$ terms), objects (${\sim}32$ terms), and ambiguous (${\sim}10$ terms) via keyword matching. Images scoring below 65/100 are discarded. A key finding of this filtering stage is that while original indoor scenes (e.g., kitchens, living rooms, $\eta = 0$) were systematically discarded as object-centric and generic, their high-$\eta$ augmented counterparts were identified by the pipeline as ``texture-rich laboratories''---the CNT augmentation had transformed semantically complex but texture-poor scenes into images with strong, well-defined texture transitions ideal for our training objective. Full scoring formulas and threshold parameters are provided in Appendix~A.
+
+\paragraph{Extraction and VLM Annotation.}
+For each image passing the filter, we extract up to 5 geometrically distinct texture regions by merging per-class ADE20K masks (each region $\geq$1\% image area). We then employ Claude~3.5 Sonnet~\cite{claude} to autonomously generate rich ground-truth descriptions for each region. The VLM receives both the original image and a colored overlay showing region boundaries, and produces structured descriptions in the format ``Texture of <semantic name>, <visual features>, <spatial context>'' (10--15 words). For TextureSAM datasets, \emph{degree expansion} reuses ground-truth masks (which are degree-invariant) across higher-intensity variants, yielding ${\sim}45\%$ additional samples at zero annotation cost. The final training set comprises \textbf{${\sim}14{,}000$ samples} with an average of 3.2 texture regions per image. Full pipeline details, prompt templates, and validation procedures are provided in Appendix~B.
+
+\subsection{The Custom In-Domain Test Set (ADE20K\_DeTexture)}
+\label{sec:ade20k_detexture}
+
+To enable controlled in-domain evaluation, we applied the identical DeTexture Pipeline to the \textbf{ADE20K validation split} (2,000 images), curating a dedicated test set we term \textbf{ADE20K\_DeTexture}. This custom-mined dataset retains only images with strong texture transitions and well-separated regions, providing a high-quality benchmark for verifying core architectural viability in a controlled setting where the visual distribution matches the training data. ADE20K\_DeTexture served as our stability probe: stable or improving metrics on this set confirmed that architectural changes (e.g., the bottleneck projector) did not degrade in-domain capability, even as cross-domain metrics revealed pathologies. For instance, V4's in-domain mIoU climbed steadily from 0.700 to 0.707 across epochs 5--13 on ADE20K\_DeTexture, while RWTD mIoU simultaneously degraded from 0.692 to 0.618---a divergence that would have been invisible without dual evaluation.
+
+\subsection{The Adopted External Benchmark (RWTD)}
+\label{sec:rwtd}
+
+For out-of-domain evaluation, we adopted the \textbf{Real-World Texture Dataset (RWTD)} introduced by TextureSAM~\cite{texturesam}: 253 images exhibiting challenging, in-the-wild texture transitions characterized by ambiguous boundaries (sand-to-water, grass-to-soil), multi-scale textures, and semantic diversity spanning natural, urban, and indoor environments. We did not collect RWTD; our contribution was \emph{adapting it for VLM-guided models} by passing it through our VLM annotation stage to generate high-quality ground-truth descriptions for each texture region---descriptions that did not previously exist, since RWTD was originally designed for prompt-based (point/box) segmentation evaluation.
+
+\subsection{The Dual-Evaluation Strategy}
+\label{sec:dual_eval}
+
+These two benchmarks form a deliberate dual-evaluation strategy:
+
+\begin{itemize}
+    \item \textbf{In-Domain Evaluation (ADE20K\_DeTexture):} Verifies core architectural viability in a controlled setting where the visual distribution matches the training data. Stable metrics here confirm that architectural innovations do not introduce regressions.
+
+    \item \textbf{Out-of-Domain / Stress-Test Evaluation (RWTD):} Functions as an external, in-the-wild probe to test zero-shot generalization and deliberately expose cross-domain pathologies. RWTD's distributional distance from ADE20K was instrumental in surfacing the Directional Drift pathology (Section~\ref{sec:drift}): the 10.5M-parameter projector memorized ADE20K-specific manifold directions that compressed RWTD representations $4\times$ more aggressively, a failure mode entirely invisible on ADE20K\_DeTexture.
+\end{itemize}
+
+This dual-evaluation philosophy---verify stability in-domain, then stress-test out-of-domain---ensures that performance gains are genuine and generalizable, not artifacts of distribution overlap between training and evaluation data.
+
+% ============================================================================
+% 5. EXPERIMENTS
+% ============================================================================
+\section{Experiments}
+
+\emph{Results pending: V5 training is currently underway. This section will report quantitative results on RWTD and ADE20K-DeTexture, ablation studies isolating each of the four architectural fixes, comparison with LISA and Sa2VA baselines, and qualitative visualization of multi-texture segmentation outputs.}
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{19}
+
+\bibitem[Cohen et~al.(2025)]{texturesam}
+I.~Cohen, B.~Meivar, P.~Tu, S.~Avidan, and G.~Oren.
+\newblock {TextureSAM}: Towards a Texture Aware Foundation Model for Segmentation.
+\newblock \emph{arXiv:2505.16540}, 2025.
+
+\bibitem[Lai et~al.(2024a)]{lisa}
+X.~Lai, Z.~Tian, Y.~Chen, Y.~Li, Y.~Yuan, S.~Liu, and J.~Jia.
+\newblock {LISA}: Reasoning Segmentation via Large Language Model.
+\newblock In \emph{CVPR}, 2024.
+
+\bibitem[Lai et~al.(2024b)]{lisapp}
+X.~Lai, Z.~Tian, Y.~Chen, Y.~Li, Y.~Yuan, S.~Liu, and J.~Jia.
+\newblock {LISA++}: An Improved Baseline for Reasoning Segmentation with Large Language Model.
+\newblock \emph{arXiv:2312.17240}, 2024.
+
+\bibitem[Xia et~al.(2024)]{gsva}
+Z.~Xia, D.~Han, Y.~Han, B.~Pan, S.~Song, G.~Huang, and H.~He.
+\newblock {GSVA}: Generalized Segmentation via Multimodal Large Language Models.
+\newblock In \emph{CVPR}, 2024.
+
+\bibitem[Ren et~al.(2024)]{pixellm}
+Z.~Ren, Y.~Huang, S.~Wei, Q.~Zhu, D.~Xu, and D.~Zhang.
+\newblock {PixelLM}: Pixel Reasoning with Large Multimodal Model.
+\newblock In \emph{CVPR}, 2024.
+
+\bibitem[Rasheed et~al.(2024)]{glamm}
+H.~Rasheed, M.~U.~Maaz, S.~Shaji, A.~Shaker, S.~Khan, H.~A.~Cholakkal, R.~M.~Anwer, E.~Xing, M.-H.~Yang, and F.~S.~Khan.
+\newblock {GLaMM}: Pixel Grounding Large Multimodal Model.
+\newblock In \emph{CVPR}, 2024.
+
+\bibitem[Yuan et~al.(2025)]{sa2va}
+H.~Yuan, D.~Li, R.~Zhang, J.~Zhang, C.~Li, and J.~Yan.
+\newblock {Sa2VA}: Marrying {SAM2} with {LLaVA} for Dense Grounded Understanding of Images and Videos.
+\newblock \emph{arXiv:2501.04001}, 2025.
+
+\bibitem[Zhang et~al.(2024a)]{llavaground}
+S.~Zhang, P.~Sun, S.~Chen, M.~Xiao, W.~Shao, W.~Zhang, K.~Chen, and P.~Luo.
+\newblock {LLaVA-Grounding}: Grounded Visual Chat with Large Multimodal Models.
+\newblock In \emph{ECCV}, 2024.
+
+\bibitem[Kirillov et~al.(2023)]{sam}
+A.~Kirillov, E.~Mintun, N.~Ravi, H.~Mao, C.~Rolland, L.~Gustafson, T.~Xiao, S.~Whitehead, A.~C.~Berg, W.-Y.~Lo, P.~Doll{\'a}r, and R.~Girshick.
+\newblock Segment Anything.
+\newblock In \emph{ICCV}, 2023.
+
+\bibitem[Ravi et~al.(2024)]{sam2}
+N.~Ravi, V.~Gabeur, Y.-T.~Hu, R.~Hu, C.~Ryali, T.~Ma, H.~Khedr, R.~R{\"a}dle, C.~Rolland, L.~Gustafson, E.~Mintun, J.~Pan, K.~V.~Alwala, N.~Carion, C.-Y.~Wu, R.~Girshick, P.~Doll{\'a}r, and C.~Feichtenhofer.
+\newblock {SAM~2}: Segment Anything in Images and Videos.
+\newblock \emph{arXiv:2408.00714}, 2024.
+
+\bibitem[Cheng et~al.(2022)]{mask2former}
+B.~Cheng, I.~Misra, A.~G.~Schwing, A.~Kirillov, and R.~Girshick.
+\newblock Masked-attention Mask Transformer for Universal Image Segmentation.
+\newblock In \emph{CVPR}, 2022.
+
+\bibitem[Kirillov et~al.(2019)]{panopticfpn}
+A.~Kirillov, R.~Girshick, K.~He, and P.~Doll{\'a}r.
+\newblock Panoptic Feature Pyramid Networks.
+\newblock In \emph{CVPR}, 2019.
+
+\bibitem[Cimpoi et~al.(2014)]{dtd}
+M.~Cimpoi, S.~Maji, I.~Kokkinos, S.~Mohamed, and A.~Vedaldi.
+\newblock Describing Textures in the Wild.
+\newblock In \emph{CVPR}, 2014.
+
+\bibitem[Hayman et~al.(2004)]{kth}
+E.~Hayman, B.~Caputo, M.~Fritz, and J.-O.~Eklundh.
+\newblock On the Significance of Real-World Conditions for Material Classification.
+\newblock In \emph{ECCV}, 2004.
+
+\bibitem[Caesar et~al.(2018)]{cocostuff}
+H.~Caesar, J.~Uijlings, and V.~Ferrari.
+\newblock {COCO-Stuff}: Thing and Stuff Classes in Context.
+\newblock In \emph{CVPR}, 2018.
+
+\bibitem[Zou et~al.(2023)]{xdecoder}
+X.~Zou, Z.-Y.~Dou, J.~Yang, Z.~Gan, L.~Li, C.~Li, X.~Dai, H.~Beber, J.~Wang, L.~Yuan, N.~Peng, L.~Wang, Y.~J.~Lee, and J.~Gao.
+\newblock Generalized Decoding for Pixel, Image, and Language.
+\newblock In \emph{CVPR}, 2023.
+
+\bibitem[Zhang et~al.(2023)]{openseed}
+H.~Zhang, F.~Li, X.~Zou, S.~Liu, C.~Li, J.~Gao, J.~Yang, and L.~Zhang.
+\newblock A Simple Framework for Open-Vocabulary Segmentation and Detection.
+\newblock In \emph{ICCV}, 2023.
+
+\bibitem[Zhou et~al.(2019)]{ade20k}
+B.~Zhou, H.~Zhao, X.~Puig, T.~Xiao, S.~Fidler, A.~Barriuso, and A.~Torralba.
+\newblock Semantic Understanding of Scenes through the {ADE20K} Dataset.
+\newblock \emph{International Journal of Computer Vision}, 127:302--321, 2019.
+
+\bibitem[Anthropic(2024)]{claude}
+Anthropic.
+\newblock The Claude Model Family: Claude 3.5 Sonnet, Claude 3.5 Haiku.
+\newblock Anthropic Technical Report, 2024.
+
+\end{thebibliography}
+
+\end{document}

@@ -94,33 +94,98 @@ def build_assistant_text(descriptions: list[str]) -> str:
 # ===================================================================== #
 
 def create_labels(input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                  tokenizer) -> torch.Tensor:
+                  tokenizer) -> tuple:
     """
-    V5 Loss Masking: -100 for ALL tokens EXCEPT <|seg|>.
+    V6 Proximity-Decayed LM Regularization.
 
-    This prevents the LoRA from receiving text-prediction gradients (which
-    caused V3's "Count Collapse" where Qwen learned to terminate early).
-    The LoRA ONLY receives gradient at [SEG] positions, through:
-      1. Trivial LM loss: predict <|seg|> given preceding context
-      2. Segmentation loss: flows back through projector → [SEG] hidden state → LoRA
+    Returns:
+        labels:     (B, L) — token IDs for assistant text, -100 for
+                    system/user/prefix/padding.
+        lm_weights: (B, L) — per-token cosine-decayed LM loss weight.
+                    High (λ_max=1.0) at the start of each TEXTURE block
+                    (linguistic anchor), low (λ_min=0.05) near <|seg|>
+                    (geometric freedom).
 
-    The text generation capability stays frozen (base Qwen weights).
+    Within each texture block of length L_k:
+        τ(i) = i / (L_k - 1)
+        λ(i) = λ_min + 0.5 * (λ_max - λ_min) * (1 + cos(π * τ))
+
+    This preserves Qwen's language generation ability (prevents V5's
+    Catastrophic Forgetting) while giving the [SEG] token spatial
+    freedom to optimise for segmentation.
     """
+    import math
     from models.qwen2sam_detexture import SEG_TOKEN
 
     seg_token_id = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
 
-    # Start with everything masked
-    labels = torch.full_like(input_ids, -100)
+    B, L = input_ids.shape
+    labels = input_ids.clone()
+    lm_weights = torch.zeros(B, L, dtype=torch.float32)
 
-    # Only unmask <|seg|> token positions
-    seg_mask = (input_ids == seg_token_id)
-    labels[seg_mask] = input_ids[seg_mask]
+    LAMBDA_MAX = 1.0    # Full LM weight at block start (linguistic anchor)
+    LAMBDA_MIN = 0.05   # Minimal LM weight near <|seg|> (geometric freedom)
 
-    # Also mask padding (redundant but explicit)
-    labels[attention_mask == 0] = -100
+    for b in range(B):
+        ids = input_ids[b]
 
-    return labels
+        # Find the assistant content start (last <|im_start|> before first <|seg|>)
+        seg_positions = (ids == seg_token_id).nonzero(as_tuple=True)[0]
+        if len(seg_positions) == 0:
+            # No <|seg|> tokens — mask everything
+            labels[b, :] = -100
+            continue
+
+        first_seg = seg_positions[0].item()
+        im_starts = (ids == im_start_id).nonzero(as_tuple=True)[0]
+        asst_start = 0
+        for pos in reversed(im_starts.tolist()):
+            if pos < first_seg:
+                # Skip past "<|im_start|>assistant\n" header (~3-4 tokens)
+                asst_start = pos + 1
+                for skip in range(pos + 1, min(pos + 8, L)):
+                    tok_str = tokenizer.decode([ids[skip].item()],
+                                                skip_special_tokens=False)
+                    if "\n" in tok_str:
+                        asst_start = skip + 1
+                        break
+                break
+
+        # Mask system/user/prefix tokens (before assistant content)
+        labels[b, :asst_start] = -100
+
+        # Mask padding
+        labels[b, attention_mask[b] == 0] = -100
+
+        # Build texture blocks from <|seg|> positions
+        blocks = []
+        for k in range(len(seg_positions)):
+            start = asst_start if k == 0 else seg_positions[k - 1].item() + 1
+            end = seg_positions[k].item()  # inclusive (<|seg|> position)
+            if start <= end:
+                blocks.append((start, end))
+
+        # Apply cosine-decayed weights within each block
+        for block_start, block_end in blocks:
+            block_len = block_end - block_start + 1
+            for i in range(block_len):
+                pos = block_start + i
+                if labels[b, pos] == -100:
+                    continue  # skip already-masked positions
+                tau = i / max(block_len - 1, 1)  # 0 at start, 1 at end
+                weight = LAMBDA_MIN + 0.5 * (LAMBDA_MAX - LAMBDA_MIN) * (
+                    1.0 + math.cos(math.pi * tau)
+                )
+                lm_weights[b, pos] = weight
+
+        # Tokens after the last <|seg|> (e.g., <|im_end|>) get minimal weight
+        last_seg = seg_positions[-1].item()
+        for pos in range(last_seg + 1, L):
+            if labels[b, pos] != -100:
+                lm_weights[b, pos] = LAMBDA_MIN
+
+    return labels, lm_weights
 
 
 # ===================================================================== #
@@ -336,14 +401,20 @@ class DeTextureCollator:
         )
         qwen_inputs.pop("token_type_ids", None)
 
-        # Labels for LM loss
+        # V6: Labels + proximity-decayed LM weights
         if not self.inference:
-            labels = create_labels(
+            labels, lm_weights = create_labels(
                 qwen_inputs["input_ids"],
                 qwen_inputs["attention_mask"],
                 self.tokenizer,
             )
-            qwen_inputs["labels"] = labels
+            # NOTE: labels are NOT passed to qwen_inputs — we compute the
+            # weighted LM loss manually in combined_loss using the logits.
+            # This allows per-token cosine-decayed weighting instead of
+            # binary -100 masking.
+            qwen_inputs["labels"] = labels  # still needed for Qwen's internal loss (used as fallback)
+        else:
+            lm_weights = None
 
         # Stack SAM3 inputs
         sam_images = torch.stack([s["sam_image"] for s in samples])
@@ -356,11 +427,14 @@ class DeTextureCollator:
         # V4: per-sample GT description lists for SAM text encoder distillation
         descriptions = [s["descriptions"] for s in samples]
 
-        return {
+        batch = {
             "qwen_inputs": qwen_inputs,
             "sam_images": sam_images,
             "index_masks": index_masks,
             "k_gts": k_gts,
-            "qwen_gt_embeds": qwen_gt_embeds,  # (B, MAX_TEXTURES, 4096)
-            "descriptions": descriptions,       # List[List[str]] for SAM text distillation
+            "qwen_gt_embeds": qwen_gt_embeds,
+            "descriptions": descriptions,
         }
+        if lm_weights is not None:
+            batch["lm_weights"] = lm_weights  # (B, L) cosine-decayed per-token weights
+        return batch

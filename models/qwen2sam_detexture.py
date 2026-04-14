@@ -539,6 +539,7 @@ class Qwen2SAMDeTexture(nn.Module):
             "k_preds": k_preds,
             "pad_mask": pad_mask,
             "lm_loss": lm_loss,
+            "qwen_logits": qwen_out.logits,  # V6: raw logits for weighted LM loss
         }
 
     # ------------------------------------------------------------------ #

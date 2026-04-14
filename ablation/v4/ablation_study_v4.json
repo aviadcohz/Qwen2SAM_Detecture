@@ -157,7 +157,7 @@
       "files": ["models/qwen2sam_v4_slim.py", "configs/detexture_v4_slim.yaml", "training/train_v4_slim.py"]
     },
     "v5_full": {
-      "status": "STAGED (code complete, awaiting V4-Slim results)",
+      "status": "ARCHITECTURE VALIDATED — Oracle mIoU=0.8098 on RWTD (epoch 7)",
       "architecture": "[SEG] Token + Bottleneck Projector (4096→512→256, 2.1M) + Qwen LoRA (r=8) + Loss Masking (-100 on text, CE only on [SEG]) + 3-Stage Curriculum (projector warmup → Qwen LoRA co-adaptation → E2E).",
       "key_innovations": [
         "[SEG] token decouples visual grounding from language context",
