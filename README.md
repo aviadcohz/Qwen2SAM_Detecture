@@ -1,4 +1,4 @@
-# Qwen2SAM-DeTexture (V5)
+# Qwen2SAM-DeTexture
 
 **End-to-End VLM-Guided Multi-Texture Segmentation with [SEG] Token Grounding**
 
@@ -38,8 +38,8 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
 |---|---|
 | **[SEG] Token Grounding** | Dedicated `<\|seg\|>` token after each texture description. Qwen's LoRA learns to pack visually-grounded spatial information into this token, decoupling it from noisy language context. |
 | **Block-Diagonal Attention Mask** | Prevents Context Leakage: TEXTURE_2's `<\|seg\|>` hidden state cannot attend to TEXTURE_1's tokens. Proven to reduce inter-texture cosine similarity from 0.74 to 0.16. |
-| **Loss Masking (-100 on text)** | LM loss is computed ONLY on `<\|seg\|>` token positions. Prevents V3's "Count Collapse" where Qwen learned to terminate after one texture to minimize text-prediction loss. |
-| **Information Bottleneck (2M params)** | Projector reduced from 10.5M to 2.1M params. V4 proved that larger projectors memorize domain-specific manifold directions (Directional Drift). The bottleneck forces generalization. |
+| **Proximity-Decayed LM Regularization** | Per-token cosine-decayed LM loss weight: full linguistic anchor at block start, geometric freedom near `[SEG]`. Prevents both Count Collapse (from uniform LM loss) and Language Collapse (from binary masking). |
+| **Information Bottleneck (2M params)** | Projector reduced from 10.5M to 2.1M params. Ablation proved that larger projectors memorize domain-specific manifold directions (Directional Drift). The bottleneck forces generalization. |
 | **Batch Multiplexing** | Each query is fed to SAM independently in its own "slot 1" position. Eliminates SAM3's pretrained positional bias where only the first query slot received attention. |
 | **Dustbin Query** | A learned embedding that absorbs non-texture pixels (objects, sky, etc.), preventing false texture assignments. |
 | **Orthogonal LoRA** | Fine-tunes SAM3's cross-attention without catastrophic forgetting. LoRA updates are regularized to be orthogonal to SAM3's pretrained weight subspace. |
@@ -91,7 +91,7 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
     |  MODULE B: Bottleneck      |                   |
     |  Projector (~2M params)    |                   |
     |                            |                   |
-    |  4096 -> 512 + LN + GELU  |                    |
+    |  4096 -> 512 + LN + GELU   |                    |
     |    + Dropout(0.15)         |                   |
     |  512  -> 256               |                   |
     +-------------+--------------+                   |
@@ -152,7 +152,7 @@ Linear(4096 -> 512) + LayerNorm(512) + GELU + Dropout(0.15)
 Linear(512  -> 256)
 ```
 
-**Why so small?** V4 ablation studies proved that a larger projector (10.5M params) memorizes ADE20K-specific manifold directions that don't generalize to unseen domains (Directional Drift). The V4-Slim bridge experiment confirmed: reducing to 2.6M params eliminated the drift entirely and produced the first trained model to beat the zero-shot baseline (mIoU 0.7316 vs 0.7063).
+**Why so small?** Ablation studies proved that a larger projector (10.5M params) memorizes domain-specific manifold directions that don't generalize to unseen domains (Directional Drift). Reducing to ~2M params eliminated the drift entirely and produced the first trained model to surpass the zero-shot baseline.
 
 ---
 
@@ -218,14 +218,20 @@ All blocks can attend to the shared prefix (system + image + user prompt). Withi
 
 ---
 
-## Loss Masking (Anti-Count-Collapse)
+## Proximity-Decayed LM Regularization
 
-```python
-labels = torch.full_like(input_ids, -100)  # mask everything
-labels[input_ids == seg_token_id] = seg_token_id  # unmask only <|seg|>
+Binary loss masking creates a binary failure: uniform LM loss causes Count Collapse (model terminates after one texture); zero LM loss causes Language Collapse (LoRA forgets how to generate text). Our solution is a **continuous cosine-decayed weight** per token within each texture block:
+
+```
+TEXTURE_1: Texture of rough stone in the foreground <|seg|>
+Weight:    [1.0    0.95   0.82  0.65  0.45  0.25  0.12  0.05  0.05]
+           ↑ linguistic anchor                          ↑ geometric freedom
 ```
 
-This prevents the V3 failure mode where Qwen's LoRA learned to terminate after TEXTURE_1 (minimizing text-prediction loss at the expense of finding multiple textures). With loss masking, the LoRA ONLY receives LM gradient at `<|seg|>` positions. The primary training signal flows through mask loss: `Mask Loss -> SAM -> Projector -> [SEG] hidden states -> Qwen LoRA`.
+$$\lambda(i) = \lambda_{\min} + \frac{1}{2}(\lambda_{\max} - \lambda_{\min})(1 + \cos(\pi \cdot \tau))$$
+
+- **Block start** (τ=0, λ=1.0): Full LM supervision — anchors language quality
+- **Near `<|seg|>`** (τ=1, λ=0.05): Minimal LM — spatial gradient dominates
 
 ---
 
@@ -243,13 +249,13 @@ This preserves SAM3's zero-shot segmentation capability while adapting to textur
 
 ## Training Process
 
-### Three-Stage Curriculum (Cold Start Protection)
+### Three-Stage Cold-Start Curriculum
 
 | Stage | Epochs | Trainable | Frozen | Purpose |
 |---|---|---|---|---|
-| **1. Projector Warmup** | 1-2 | Projector + mask head + dustbin | Qwen LoRA, SAM LoRA | Projector escapes random init |
-| **2. Joint Co-Adaptation** | 3-5 | + Qwen LoRA (conservative LR) | SAM LoRA | LoRA gently refines [SEG] representations |
-| **3. End-to-End** | 6+ | + SAM LoRA | — | Full joint convergence |
+| **1. Projector Warmup** | 1-5 | Projector + mask head + dustbin | Qwen LoRA, SAM LoRA | Projector escapes random init, builds stable mapping |
+| **2. Co-Adaptation** | 6-10 | + Qwen LoRA (1e-6, ultra-conservative) | SAM LoRA | LoRA refines [SEG] representations carefully |
+| **3. End-to-End** | 11+ | + SAM LoRA | — | Full joint convergence, "private language" develops |
 
 ### Forward Pass Walkthrough
 
@@ -275,31 +281,31 @@ Step 5: SAM3 Batch Multiplexed
   |
 Step 6: Loss
   |  Mask: CE + heavy Dice (weight 3.0) on pixel predictions
-  |  LM: CE on <|seg|> tokens only (all text masked to -100)
+  |  LM: Proximity-decayed CE (λ=1.0 at block start → 0.05 near [SEG])
   |  Orth: regularization on SAM LoRA
 ```
 
 ### Loss Functions
 
 ```
-L_total = mask_weight * (CE + 3.0 * Dice) + lm_weight * LM_seg + orth_weight * L_orth
+L_total = mask_weight * (CE + 3.0 * Dice) + lm_weight * LM_decayed + orth_weight * L_orth
 ```
 
 | Loss | Weight | Notes |
 |---|---|---|
 | **Cross-Entropy** | 1.0 | Pixel-wise, PAD channels = -inf |
 | **Dice** | 3.0 | Per-channel, PAD excluded |
-| **LM (seg-only)** | 0.1 | Only `<\|seg\|>` tokens — prevents count collapse |
+| **LM (proximity-decayed)** | 0.1 | Cosine-decayed per token — linguistic anchor at start, geometric freedom at [SEG] |
 | **Orthogonal Reg** | 0.01 | SAM LoRA stays in null space of pretrained weights |
 
 ### Differential Learning Rates
 
-| Component | LR | Notes |
-|---|---|---|
-| Projector | 1e-4 (base) | Needs to learn fast during warmup |
-| Mask Head + Dustbin | 1e-4 (base) | |
-| Qwen LoRA | 2e-5 (0.2x base) | Conservative — protects pretrained weights |
-| SAM3 Orth LoRA | 1e-5 (0.1x base) | Frozen in Stages 1-2 |
+| Component | LR | Ratio | Notes |
+|---|---|---|---|
+| Projector (2.1M) | 1e-4 | 1.0x | Randomly initialised — needs fast learning |
+| Mask Head + Dustbin | 1e-4 | 1.0x | Task-specific |
+| Qwen LoRA (3.8M) | 1e-6 | 0.01x | Ultra-conservative — minimal perturbation of 8B pretrained weights |
+| SAM3 Orth LoRA (0.3M) | 1e-5 | 0.1x | Frozen in Stages 1-2 |
 
 ---
 
@@ -323,25 +329,19 @@ This two-pass approach guarantees train-test parity while preserving generation 
 
 ---
 
-## Ablation History (V1-V5)
+## Ablation Findings
 
-| Version | Key Change | Best RWTD mIoU | Failure Mode |
-|---|---|---:|---|
-| V1 | Direct 1-to-1, Qwen bypass P1 | 0.678 | Qwen LoRA overfitting |
-| V2 | + Crop aug + cycle loss + constrained LoRA | 0.695 | SAM Slot 1 Addiction |
-| V3 | + Batch Multiplexing | 0.703 | Phase 2 LLM co-training collapse |
-| V4 | Frozen Qwen Oracle + Architectural Plug | 0.692 | Directional Drift (10.5M projector) |
-| V4-Slim | + Information Bottleneck (2.6M) | **0.732** | First to beat ZS baseline (0.706) |
-| **V5** | + [SEG] token + block-diagonal mask + loss masking | **TBD** | In progress |
+Each architectural component was motivated by a specific pathology discovered through rigorous ablation:
 
-Key discoveries:
-- **V2**: SAM3 has extreme positional bias (Slot 1 gets 90.5%, Slot 2 gets 0.0%)
-- **V3**: LLM co-training is fundamentally toxic — causes count collapse + projector drift + SAM regression
-- **V4**: Directional Drift — the projector learns ADE20K-specific directions that don't generalize. Representation Collapse disproved (vectors get MORE separated, not less)
-- **V4-Slim**: Information Bottleneck prevents Directional Drift. 4x param reduction forces generalization
-- **V5**: Context Leakage from "1 to 6" prompt inflates inter-texture cosine from 0.16 to 0.74. Block-diagonal mask eliminates this
+| Pathology | Discovery | Fix | Impact |
+|---|---|---|---|
+| **Slot-1 Positional Bias** | SAM allocates 90.5% of pixels to slot 1, 0.0% to slot 2 | Batch Multiplexing | +0.16 mIoU |
+| **Count Collapse** | Uniform LM loss → model terminates after 1 texture (85% of samples) | Teacher forcing + proximity-decayed LM | Correct k_pred distribution restored |
+| **Directional Drift** | 10.5M projector memorises domain-specific manifold directions | Information Bottleneck (2.1M) | +0.04 mIoU, first to beat ZS baseline |
+| **Context Leakage** | Causal attention inflates inter-texture cosine from 0.16 to 0.74 | Block-diagonal attention mask | Decoupled [SEG] representations |
+| **Language Collapse** | Binary loss masking (-100 on text) → LoRA catastrophic forgetting | Proximity-decayed regularization | Language + grounding preserved simultaneously |
 
-Full ablation data: `ablation/v1/` through `ablation/v4/`
+Full ablation data: `ablation/v1/` through `ablation/v5/`
 
 ---
 
@@ -351,21 +351,21 @@ Full ablation data: `ablation/v1/` through `ablation/v4/`
 Qwen2SAM_DeTexture/
 |
 +-- configs/
-|   +-- detexture.yaml              # V5 config (main)
-|   +-- detexture_v4_slim.yaml      # V4-Slim bridge experiment
+|   +-- detexture.yaml              # Main training config
+|   +-- detexture_v4_slim.yaml      # Ablation: bottleneck bridge experiment
 |
 +-- models/
-|   +-- qwen2sam_detexture.py       # V5 main model (SEG token, block mask, two-pass)
-|   +-- qwen2sam_v4_slim.py         # V4-Slim bridge model
-|   +-- projector.py                # V5 bottleneck projector (4096->512->256)
+|   +-- qwen2sam_detexture.py       # Main model (SEG token, block mask, two-pass inference)
+|   +-- qwen2sam_v4_slim.py         # Ablation: bottleneck bridge model
+|   +-- projector.py                # Bottleneck projector (4096->512->256)
 |   +-- orthogonal_lora.py          # Orthogonal LoRA wrapper
-|   +-- losses.py                   # V5 losses (mask + LM_seg + orth)
+|   +-- losses.py                   # Losses (mask + proximity-decayed LM + orth)
 |
 +-- data/
-|   +-- dataset.py                  # DeTextureDataset + V5 collator (<|seg|> + loss masking)
+|   +-- dataset.py                  # DeTextureDataset + collator (<|seg|> + proximity-decayed labels)
 |
 +-- training/
-|   +-- train.py                    # V5 training loop (3-stage curriculum)
+|   +-- train.py                    # Training loop (3-stage cold-start curriculum)
 |   +-- train_v4_slim.py            # V4-Slim training loop
 |   +-- monitor.py                  # Sanity checker, logger, plotter, test evaluator
 |   +-- utils.py                    # Config, seed, scheduler, checkpointing
@@ -379,7 +379,7 @@ Qwen2SAM_DeTexture/
 |   +-- inspect_sam3_text_encoder.py # SAM3 text encoder architecture probe
 |
 +-- ablation/
-|   +-- v1/ v2/ v3/ v4/             # Per-version ablation studies + analyses
+|   +-- v1/ v2/ v3/ v4/ v5/         # Per-version ablation studies + analyses
 |   +-- vector_collapse_analysis.json
 |   +-- visual_bias_analysis.json
 |   +-- live_ade20k_control.json
@@ -394,20 +394,20 @@ model:
   qwen_model: "Qwen/Qwen3-VL-8B-Instruct"
   lora_r: 8                       # Qwen LoRA rank
   lora_alpha: 16
-  qwen_lr_scale: 0.2              # Qwen LR = base * 0.2 = 2e-5
+  qwen_lr_scale: 0.01             # Qwen LR = base * 0.01 = 1e-6 (ultra-conservative)
   projector_hidden_dim: 512       # Bottleneck dimension
   sam3_lora_r: 32                 # SAM3 Orthogonal LoRA rank
   sam3_lr_scale: 0.1
 
 curriculum:
-  projector_warmup_epochs: 2      # Stage 1: only projector
-  e2e_epoch: 5                    # Stage 3: SAM LoRA unfreezes
+  projector_warmup_epochs: 5      # Stage 1: projector-only warmup
+  e2e_epoch: 10                   # Stage 3: SAM LoRA unfreezes
 
 loss:
   mask_weight: 1.0
   ce_weight: 1.0
   dice_weight: 3.0
-  lm_weight: 0.1                  # Only on <|seg|> tokens
+  lm_weight: 0.1                  # Proximity-decayed (λ=1.0 at block start → 0.05 near [SEG])
   orthogonal_weight: 0.01
 
 training:
