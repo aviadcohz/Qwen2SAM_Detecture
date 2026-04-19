@@ -117,19 +117,24 @@
   ],
 
   "next_steps": {
-    "oracle_upper_bound_run": {
-      "status": "IN PROGRESS — Stage 4 (Qwen LoRA frozen, Projector + SAM LoRA only)",
-      "goal": "Find the geometric architecture's plateau. Expected: 0.82-0.85 mIoU as SAM LoRA and projector continue optimising.",
-      "config_change": "geometric_only_epoch: 7 — freezes Qwen LoRA, cuts seg_grad_to_lm"
+    "v6_completed": {
+      "status": "COMPLETED — 16 epochs. Language Collapse FIXED. Domain overfitting discovered in Stage 3.",
+      "key_results": {
+        "ep10_rwtd_oracle": 0.713,
+        "ep15_rwtd_oracle": 0.678,
+        "lm_loss_trajectory": "3.67 → 1.32 (healthy, no collapse)",
+        "val_miou_ep16": 0.719
+      },
+      "diagnosis": "Latent Co-Adaptation Churn: projector at 1e-4 (100x faster than LoRA at 1e-6) continuously shifts feature distribution, causing SAM LoRA to learn ADE20K-specific patterns that hurt RWTD."
     },
-    "v6_language_fix": {
-      "status": "PLANNED — after Oracle plateau is established",
-      "approach_options": [
-        "Partial loss masking: keep LM loss on TEXTURE_N: prefix tokens + <|im_end|> as linguistic anchors",
-        "Lower qwen_lr_scale: 0.2 → 0.02-0.05 to slow LoRA drift",
-        "Two-phase LoRA: freeze LoRA text layers, only train LoRA on layers that feed [SEG]",
-        "Periodic generation validation: run inference_forward on 10 val samples every epoch, track text coherence score"
-      ]
+    "v6b_cautious_coadaptation": {
+      "status": "NEXT RUN",
+      "fixes": [
+        "10x projector LR decay at Stage 2 (1e-4 → 1e-5)",
+        "10x stronger orthogonal clamp in Stage 3 (0.01 → 0.1)",
+        "Projector settles so LoRA can build on stable ground"
+      ],
+      "backup_plan": "If RWTD still degrades → freeze SAM LoRA entirely (skip Stage 3)"
     }
   }
 }

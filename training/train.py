@@ -48,71 +48,53 @@ from training.monitor import DataSanityChecker, TrainingLogger, PlotGenerator, T
 #  Curriculum                                                             #
 # ===================================================================== #
 
-def apply_curriculum(model, epoch, cfg):
+def _set_qwen_lora_grad(model, requires_grad: bool):
+    for n, p in model.qwen.named_parameters():
+        if "lora" in n.lower():
+            p.requires_grad = requires_grad
+
+
+def decay_bridge_lr(optimizer, scheduler, factor: float) -> tuple:
+    """Multiply the bridge param group's base LR (and current LR) by `factor`.
+
+    Mutates both `scheduler.base_lrs` and `pg["lr"]` so the next scheduler.step()
+    recomputes the cosine-decayed LR from the new base. Returns (old_base, new_base).
     """
-    V5 Three-Stage Curriculum (Cold Start Protection).
+    for i, pg in enumerate(optimizer.param_groups):
+        if pg.get("name") == "bridge":
+            old_base = scheduler.base_lrs[i]
+            scheduler.base_lrs[i] = old_base * factor
+            pg["lr"] = pg["lr"] * factor
+            return old_base, scheduler.base_lrs[i]
+    return None, None
 
-    Stage 1 — Projector Warmup (epoch < projector_warmup_epochs):
-      - ONLY Projector + mask head + dustbin train
-      - Qwen LoRA FROZEN (protects pretrained weights from garbage gradients)
-      - SAM LoRA FROZEN
-      - Projector absorbs initial random-weight shock and finds a baseline
-        mapping from base-Qwen [SEG] hidden states to SAM's manifold
 
-    Stage 2 — Joint Co-Adaptation (projector_warmup_epochs <= epoch < e2e_epoch):
-      - Qwen LoRA UNFROZEN at conservative LR (e.g. 2e-5 vs projector's 1e-4)
-      - Projector continues training at full LR
-      - SAM LoRA still FROZEN
-      - Qwen LoRA carefully refines [SEG] representations without being
-        yanked around by projector instability
+def apply_curriculum(model, epoch, cfg):
+    """V7 Two-Stage Curriculum (SAM permanently frozen).
 
-    Stage 3 — End-to-End Fine-Tuning (epoch >= e2e_epoch):
-      - SAM LoRA UNFROZEN
-      - All three components train jointly to convergence
+    Stage 1 — Bridge Warmup (epoch < projector_warmup_epochs):
+      - Bridge + mask head + dustbin train at full base LR (1e-4).
+      - Qwen LoRA FROZEN.
+
+    Stage 2 — Qwen Sync + Bridge Decay (epoch >= projector_warmup_epochs):
+      - Qwen LoRA UNFROZEN at base * qwen_lr_scale (= 1e-6).
+      - Bridge base LR decayed 10× (1e-4 → 1e-5) via decay_bridge_lr.
+
+    SAM3 stays frozen forever (no Stage 3) — Zero-Shot RWTD at 0.928 confirmed
+    SAM natively understands our prompts. Unfreezing it destroys OOD generality.
+
+    Returns (phase, loss_overrides). Bridge LR mutation is handled by
+    decay_bridge_lr() invoked once at Stage 2 entry in the main loop.
     """
     curriculum = cfg.get("curriculum", {})
-    warmup_epochs = curriculum.get("projector_warmup_epochs", 2)
-    e2e_epoch = curriculum.get("e2e_epoch", 5)
-
-    def _freeze_qwen_lora(model):
-        for n, p in model.qwen.named_parameters():
-            if "lora" in n.lower():
-                p.requires_grad = False
-
-    def _unfreeze_qwen_lora(model):
-        for n, p in model.qwen.named_parameters():
-            if "lora" in n.lower():
-                p.requires_grad = True
-
-    def _freeze_sam_lora(model):
-        for m in model.sam3_lora_modules:
-            if hasattr(m, "lora_A"):
-                m.lora_A.requires_grad = False
-            if hasattr(m, "lora_B"):
-                m.lora_B.requires_grad = False
-
-    def _unfreeze_sam_lora(model):
-        for m in model.sam3_lora_modules:
-            if hasattr(m, "lora_A"):
-                m.lora_A.requires_grad = True
-            if hasattr(m, "lora_B"):
-                m.lora_B.requires_grad = True
+    warmup_epochs = curriculum.get("projector_warmup_epochs", 12)
 
     if epoch < warmup_epochs:
-        # Stage 1: Projector Warmup — only projector trains
-        _freeze_qwen_lora(model)
-        _freeze_sam_lora(model)
+        _set_qwen_lora_grad(model, False)
         return 1, {}
-    elif epoch < e2e_epoch:
-        # Stage 2: Joint Co-Adaptation — Qwen LoRA (slow) + Projector (fast)
-        _unfreeze_qwen_lora(model)
-        _freeze_sam_lora(model)
-        return 2, {}
     else:
-        # Stage 3: End-to-End — all components train
-        _unfreeze_qwen_lora(model)
-        _unfreeze_sam_lora(model)
-        return 3, {}
+        _set_qwen_lora_grad(model, True)
+        return 2, {}
 
 
 # ===================================================================== #
@@ -342,7 +324,7 @@ def main():
         )
 
     # ---- Model --------------------------------------------------------- #
-    print("Building Qwen2SAM-DeTexture V5 model...")
+    print("Building Qwen2SAM-DeTexture V7 model...")
     model = Qwen2SAMDeTexture(cfg, device=str(device))
     params = model.num_trainable_params()
     print(f"Trainable parameters:")
@@ -435,20 +417,21 @@ def main():
         print(f"  Resumed at epoch {start_epoch + 1}, best_iou={best_iou:.4f}")
 
     # ---- Training loop ------------------------------------------------- #
-    stage_initialized = {1: False, 2: False, 3: False}
+    stage_initialized = {1: False, 2: False}
 
-    warmup_ep = curriculum.get("projector_warmup_epochs", 2)
-    e2e_ep = curriculum.get("e2e_epoch", 5)
+    warmup_ep = curriculum.get("projector_warmup_epochs", 12)
+    bridge_decay_s2 = curriculum.get("projector_lr_decay_at_stage2", 0.1)
 
-    print(f"\nStarting V5 training: epochs {start_epoch+1}-{train_cfg['num_epochs']}")
+    print(f"\nStarting V7 Two-Stage Curriculum: epochs {start_epoch+1}-{train_cfg['num_epochs']}")
     print(f"  {len(train_ds)} train / {len(val_ds)} val samples")
     print(f"  Effective batch: {train_cfg['batch_size']} × "
           f"{train_cfg['gradient_accumulation_steps']} = "
           f"{train_cfg['batch_size'] * train_cfg['gradient_accumulation_steps']}")
-    print(f"  Stage 1: Projector Warmup (epochs 1-{warmup_ep})")
-    print(f"  Stage 2: + Qwen LoRA at conservative LR (epochs {warmup_ep+1}-{e2e_ep})")
-    print(f"  Stage 3: + SAM LoRA — End-to-End (epochs {e2e_ep+1}+)")
-    print(f"  [SEG] token training with loss masking (CE only on <|seg|>)")
+    print(f"  Stage 1: Bridge @ base LR (epochs 1-{warmup_ep})")
+    print(f"  Stage 2: + Qwen LoRA; Bridge base LR ×{bridge_decay_s2} "
+          f"(epochs {warmup_ep+1}-{train_cfg['num_epochs']})")
+    print(f"  SAM3 frozen permanently (no Stage 3).")
+    print(f"  Exponential LM weights active (α=2.0).")
 
     for epoch in range(start_epoch, train_cfg["num_epochs"]):
         phase, loss_overrides = apply_curriculum(model, epoch, cfg)
@@ -457,14 +440,14 @@ def main():
             stage_initialized[phase] = True
             n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             if phase == 1:
-                print(f"\n  *** STAGE 1: Projector Warmup (epoch {epoch+1}) ***")
-                print(f"  Qwen LoRA FROZEN. SAM LoRA FROZEN. Only projector trains.")
+                print(f"\n  *** STAGE 1: Bridge Warmup (epoch {epoch+1}) ***")
+                print(f"  Qwen LoRA FROZEN. SAM frozen. Only Bridge + mask head trains.")
             elif phase == 2:
-                print(f"\n  *** STAGE 2: Joint Co-Adaptation (epoch {epoch+1}) ***")
-                print(f"  Qwen LoRA UNFROZEN (conservative LR). Projector continues.")
-            elif phase == 3:
-                print(f"\n  *** STAGE 3: End-to-End (epoch {epoch+1}) ***")
-                print(f"  SAM LoRA UNFROZEN. All components train jointly.")
+                old_base, new_base = decay_bridge_lr(optimizer, scheduler, bridge_decay_s2)
+                print(f"\n  *** STAGE 2: Qwen Sync + Bridge Decay (epoch {epoch+1}) ***")
+                print(f"  Qwen LoRA UNFROZEN (base × qwen_lr_scale).")
+                if old_base is not None:
+                    print(f"  Bridge base LR DECAYED: {old_base:.1e} → {new_base:.1e} ({bridge_decay_s2}x)")
             print(f"  Trainable params: {n_trainable:,}")
 
         print(f"\n{'='*60}")

@@ -39,36 +39,39 @@ def preprocess_image_for_sam3(image: np.ndarray, size: int = SAM3_SIZE) -> torch
 
 
 # ===================================================================== #
-#  Prompt templates (exact proven text — DO NOT MODIFY)                   #
+#  V7 Prompt templates — Object-aware with <|seg|> shown in format        #
 # ===================================================================== #
 
 SYSTEM_PROMPT = (
-    "You are an expert at analyzing surface textures in images. Always respond "
-    "in the exact format requested, with no extra text."
+    "You analyze surface textures in images. Always respond in the exact "
+    "format requested, with no extra text."
 )
 
+# The {N} slot is "between 1 and 6" at training time; ablation scripts can
+# substitute "exactly 2" etc. without rewriting the whole template.
 USER_PROMPT_TEMPLATE = (
-    "This image contains exactly {N} main visually distinct regions separated "
-    "by boundaries (for example, contrasting materials, surfaces, or textures).\n\n"
-    "Write a single, highly descriptive phrase (approximately 10-15 words) for "
-    "each region. Include the following precise information:\n"
-    "1. Semantic Name: A natural, common name for the material or surface.\n"
-    "2. Distinct Visual Features: The core visual attributes like color, pattern, "
-    "or texture that strongly contrast with the other regions.\n"
-    "3. Spatial Context: A brief note on its general position (e.g., 'foreground', "
-    "'background', 'top-left', 'bottom-right', 'center', 'top-right', 'bottom-left').\n\n"
-    "IMPORTANT: Describe the ENTIRE region as a collective group, NOT individual "
-    "objects within it. Think of each region as a surface/area, not as a single "
-    "object.\n\n"
-    "Format your response exactly like this:\n"
-    "TEXTURE_1: Texture of <description>\n"
-    "TEXTURE_2: Texture of <description>\n"
-    "...\n"
-    "TEXTURE_{N}: Texture of <description>"
+    "This image contains {N} main visually distinct regions separated by a "
+    "boundary (for example, a prominent foreground object and its background, "
+    "or contrasting materials).\n\n"
+    "Write a single, highly descriptive phrase (approximately 10-15 words) "
+    "for each region. Include the following precise information:\n"
+    "1. Semantic Name: A natural, common name for the material or object.\n"
+    "2. Distinct Visual Features: The core visual attributes like color, "
+    "pattern, or texture that strongly contrast with other regions.\n"
+    "3. Spatial Context: A brief note on its general position (e.g., "
+    "'foreground', 'background', 'top-left').\n\n"
+    "IMPORTANT: Describe the ENTIRE region as a collective group, NOT "
+    "individual objects within it. Think of each region as a surface/area, "
+    "not as a single object.\n\n"
+    "Format your response exactly like this for the number of regions "
+    "present:\n"
+    "TEXTURE_1: Texture of <description> <|seg|>\n"
+    "TEXTURE_2: Texture of <description> <|seg|>\n"
+    "..."
 )
 
-# Training: use "1 to 6" to force model to dynamically decide count
-TRAIN_USER_PROMPT = USER_PROMPT_TEMPLATE.format(N="1 to 6")
+# V7 training prompt: flexible count "between 1 and 6".
+TRAIN_USER_PROMPT = USER_PROMPT_TEMPLATE.format(N="between 1 and 6")
 
 
 def build_assistant_text(descriptions: list[str]) -> str:
@@ -93,30 +96,61 @@ def build_assistant_text(descriptions: list[str]) -> str:
 #  Label creation (standalone — masks system/user tokens)                 #
 # ===================================================================== #
 
+def find_assistant_start(ids: torch.Tensor, tokenizer, im_start_id: int) -> int:
+    """Locate the index of the first assistant-content token.
+
+    The assistant turn is marked by the last `<|im_start|>` token in the
+    sequence (Qwen chat template puts the assistant header at the end of
+    the prompt). Skips past "assistant\\n" by scanning for the newline.
+    """
+    L = ids.shape[0]
+    im_starts = (ids == im_start_id).nonzero(as_tuple=True)[0]
+    if len(im_starts) == 0:
+        return 0
+    last_im_start = int(im_starts[-1].item())
+    asst_start = last_im_start + 1
+    for skip in range(last_im_start + 1, min(last_im_start + 8, L)):
+        tok_str = tokenizer.decode([int(ids[skip].item())],
+                                    skip_special_tokens=False)
+        if "\n" in tok_str:
+            asst_start = skip + 1
+            break
+    return asst_start
+
+
 def create_labels(input_ids: torch.Tensor, attention_mask: torch.Tensor,
                   tokenizer) -> tuple:
-    """
-    V6 Proximity-Decayed LM Regularization.
+    """V7 Exponential LM Loss Weighting.
+
+    Weight(d) = 1 - exp(-α * d), α = 2.0
+      where d = token-wise distance to the nearest assistant-region
+      <|seg|> token. Weight at d=0 (the [SEG] token itself) is forced
+      to 0.0 — Qwen has total freedom to warp this token for geometry.
+
+    Example weights:
+      d=0 → 0.000 (SEG token, free)
+      d=1 → 0.865
+      d=2 → 0.982
+      d=3 → 0.998
+      d≥4 → ≈1.0 (full LM supervision)
+
+    This is a "cliff": the LM pressure spikes sharply outside the
+    [SEG] itself, preventing V5's catastrophic language forgetting
+    without the gentle-tug-of-war we saw with V6's cosine schedule.
+
+    Note on V7 prompt template: the user prompt contains literal
+    "<|seg|>" text which tokenises to the special SEG token. We filter
+    seg positions to the assistant region only so prompt-side SEG
+    tokens don't corrupt weight computation.
 
     Returns:
         labels:     (B, L) — token IDs for assistant text, -100 for
                     system/user/prefix/padding.
-        lm_weights: (B, L) — per-token cosine-decayed LM loss weight.
-                    High (λ_max=1.0) at the start of each TEXTURE block
-                    (linguistic anchor), low (λ_min=0.05) near <|seg|>
-                    (geometric freedom).
-
-    Within each texture block of length L_k:
-        τ(i) = i / (L_k - 1)
-        λ(i) = λ_min + 0.5 * (λ_max - λ_min) * (1 + cos(π * τ))
-
-    This preserves Qwen's language generation ability (prevents V5's
-    Catastrophic Forgetting) while giving the [SEG] token spatial
-    freedom to optimise for segmentation.
+        lm_weights: (B, L) — per-token exponential-cliff LM weight.
     """
-    import math
     from models.qwen2sam_detexture import SEG_TOKEN
 
+    ALPHA = 2.0
     seg_token_id = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
     im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
 
@@ -124,66 +158,33 @@ def create_labels(input_ids: torch.Tensor, attention_mask: torch.Tensor,
     labels = input_ids.clone()
     lm_weights = torch.zeros(B, L, dtype=torch.float32)
 
-    LAMBDA_MAX = 1.0    # Full LM weight at block start (linguistic anchor)
-    LAMBDA_MIN = 0.05   # Minimal LM weight near <|seg|> (geometric freedom)
-
     for b in range(B):
         ids = input_ids[b]
+        asst_start = find_assistant_start(ids, tokenizer, im_start_id)
 
-        # Find the assistant content start (last <|im_start|> before first <|seg|>)
-        seg_positions = (ids == seg_token_id).nonzero(as_tuple=True)[0]
+        # Only SEG tokens in the assistant region count (V7 prompt also
+        # contains <|seg|> as literal text).
+        all_seg = (ids == seg_token_id).nonzero(as_tuple=True)[0]
+        seg_positions = all_seg[all_seg >= asst_start]
         if len(seg_positions) == 0:
-            # No <|seg|> tokens — mask everything
             labels[b, :] = -100
             continue
 
-        first_seg = seg_positions[0].item()
-        im_starts = (ids == im_start_id).nonzero(as_tuple=True)[0]
-        asst_start = 0
-        for pos in reversed(im_starts.tolist()):
-            if pos < first_seg:
-                # Skip past "<|im_start|>assistant\n" header (~3-4 tokens)
-                asst_start = pos + 1
-                for skip in range(pos + 1, min(pos + 8, L)):
-                    tok_str = tokenizer.decode([ids[skip].item()],
-                                                skip_special_tokens=False)
-                    if "\n" in tok_str:
-                        asst_start = skip + 1
-                        break
-                break
-
-        # Mask system/user/prefix tokens (before assistant content)
+        # Mask prefix (system/user/assistant header) and padding.
         labels[b, :asst_start] = -100
-
-        # Mask padding
         labels[b, attention_mask[b] == 0] = -100
 
-        # Build texture blocks from <|seg|> positions
-        blocks = []
-        for k in range(len(seg_positions)):
-            start = asst_start if k == 0 else seg_positions[k - 1].item() + 1
-            end = seg_positions[k].item()  # inclusive (<|seg|> position)
-            if start <= end:
-                blocks.append((start, end))
+        # Vectorised per-position distance-to-nearest-SEG within assistant.
+        positions = torch.arange(L, dtype=torch.long)
+        dists = (positions.unsqueeze(1) - seg_positions.cpu().unsqueeze(0)).abs()
+        min_d = dists.min(dim=1).values.float()  # (L,)
+        w = 1.0 - torch.exp(-ALPHA * min_d)       # (L,)
+        w[seg_positions] = 0.0                    # SEG token: free
 
-        # Apply cosine-decayed weights within each block
-        for block_start, block_end in blocks:
-            block_len = block_end - block_start + 1
-            for i in range(block_len):
-                pos = block_start + i
-                if labels[b, pos] == -100:
-                    continue  # skip already-masked positions
-                tau = i / max(block_len - 1, 1)  # 0 at start, 1 at end
-                weight = LAMBDA_MIN + 0.5 * (LAMBDA_MAX - LAMBDA_MIN) * (
-                    1.0 + math.cos(math.pi * tau)
-                )
-                lm_weights[b, pos] = weight
-
-        # Tokens after the last <|seg|> (e.g., <|im_end|>) get minimal weight
-        last_seg = seg_positions[-1].item()
-        for pos in range(last_seg + 1, L):
-            if labels[b, pos] != -100:
-                lm_weights[b, pos] = LAMBDA_MIN
+        # Zero weights outside assistant and on padding / already-masked.
+        w[:asst_start] = 0.0
+        w[attention_mask[b] == 0] = 0.0
+        lm_weights[b] = w
 
     return labels, lm_weights
 

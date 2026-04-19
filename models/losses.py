@@ -160,7 +160,9 @@ def combined_loss(
     w = cfg.get("loss", {})
     lam_mask = w.get("mask_weight", 1.0)
     lam_lm = w.get("lm_weight", 0.1)
-    lam_orth = w.get("orthogonal_weight", 0.01)
+    # V7: SAM3 frozen permanently, no LoRA → orthogonal_regularization()
+    # returns 0 regardless of this weight. Kept for interface compatibility.
+    lam_orth = w.get("orthogonal_weight", 0.0)
     ce_w = w.get("ce_weight", 1.0)
     dice_w = w.get("dice_weight", 3.0)
 

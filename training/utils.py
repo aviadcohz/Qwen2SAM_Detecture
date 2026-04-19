@@ -112,16 +112,7 @@ def save_checkpoint(model, optimizer, epoch, path, extra=None):
     if hasattr(model, "dustbin_embed"):
         state["dustbin_embed"] = model.dustbin_embed.data
 
-    # Save LoRA modules from SAM3 (both wrapped linears and parametrized MHA weights)
-    lora_state = {}
-    for name, module in model.named_modules():
-        from models.orthogonal_lora import OrthogonalLoRALinear, OrthogonalLoRAParametrization
-        if isinstance(module, (OrthogonalLoRALinear, OrthogonalLoRAParametrization)):
-            lora_state[name] = {
-                "lora_A": module.lora_A.data.cpu(),
-                "lora_B": module.lora_B.data.cpu(),
-            }
-    state["sam3_lora"] = lora_state
+    # V7: SAM3 frozen permanently (no LoRA). Nothing extra to save.
 
     if extra:
         state.update(extra)

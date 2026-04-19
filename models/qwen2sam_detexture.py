@@ -27,8 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 
-from models.projector import DescriptionProjector
-from models.orthogonal_lora import apply_orthogonal_lora_to_mha, OrthogonalLoRALinear
+from models.bridge import BridgeProjector
 
 
 # ===================================================================== #
@@ -165,21 +164,24 @@ class Qwen2SAMDeTexture(nn.Module):
             self.qwen.gradient_checkpointing_enable()
         self.qwen.to(self.device)
 
-        # ---- SAM3 ------------------------------------------------------ #
+        # ---- SAM3 (100% frozen in V7 — no LoRA) ------------------------ #
         self.sam3 = load_sam3(model_cfg, self.device)
         self._freeze_sam3()
-        self.sam3_lora_modules = self._apply_sam3_orthogonal_lora(model_cfg)
+        self.sam3_lora_modules = []  # retained for save/load back-compat; empty
         self.sam3.to(device=self.device)
 
         # ---- LLM dim --------------------------------------------------- #
         qwen_cfg = getattr(self.qwen.config, "text_config", self.qwen.config)
         self.llm_dim = qwen_cfg.hidden_size  # 4096 for Qwen3-VL-8B
 
-        # ---- V5 Bottleneck Projector ------------------------------------ #
-        self.projector = DescriptionProjector(
-            llm_dim=self.llm_dim, sam_dim=256,
-            hidden_dim=model_cfg.get("projector_hidden_dim", 512),
+        # ---- V7 Bridge Projector: 4096 → 1024 → (frozen resizer) → 256 - #
+        self.bridge = BridgeProjector(
+            llm_dim=self.llm_dim,
+            sam_text_width=model_cfg.get("projector_hidden_dim", 1024),
+            dropout=model_cfg.get("projector_dropout", 0.4),
         ).to(self.device)
+        # Reuse SAM3's pretrained 1024→256 text projection; already frozen.
+        self._sam_resizer = self.sam3.backbone.language_backbone.resizer
 
         # ---- Learnable DUSTBIN embedding -------------------------------- #
         self.dustbin_embed = nn.Parameter(
@@ -198,39 +200,6 @@ class Qwen2SAMDeTexture(nn.Module):
     def _freeze_sam3(self):
         for param in self.sam3.parameters():
             param.requires_grad = False
-
-    def _apply_sam3_orthogonal_lora(self, model_cfg: dict) -> list:
-        r = model_cfg.get("sam3_lora_r", 8)
-        alpha = model_cfg.get("sam3_lora_alpha", 16.0)
-        n_sing = model_cfg.get("sam3_lora_n_singular", 32)
-        targets = tuple(model_cfg.get("sam3_lora_targets", ["q", "v"]))
-
-        all_lora_modules = []
-
-        for layer in self.sam3.transformer.encoder.layers:
-            if hasattr(layer, "cross_attn_image"):
-                mha = layer.cross_attn_image
-                lora_dict = apply_orthogonal_lora_to_mha(
-                    mha, r=r, alpha=alpha, n_singular=n_sing,
-                    target_projections=targets,
-                )
-                all_lora_modules.extend(lora_dict.values())
-
-        seg_head = self.sam3.segmentation_head
-        if seg_head is not None and hasattr(seg_head, "cross_attend_prompt"):
-            if seg_head.cross_attend_prompt is not None:
-                lora_dict = apply_orthogonal_lora_to_mha(
-                    seg_head.cross_attend_prompt, r=r, alpha=alpha,
-                    n_singular=n_sing, target_projections=targets,
-                )
-                all_lora_modules.extend(lora_dict.values())
-
-        n_lora = len(all_lora_modules)
-        n_params = sum(
-            p.numel() for m in all_lora_modules for p in [m.lora_A, m.lora_B]
-        )
-        print(f"  SAM3 Orthogonal LoRA: {n_lora} modules, {n_params:,} params")
-        return all_lora_modules
 
     # ------------------------------------------------------------------ #
     #  V5 Block-Diagonal Attention Mask (Anti-Context-Leakage)             #
@@ -276,31 +245,15 @@ class Qwen2SAMDeTexture(nn.Module):
         for b in range(B):
             ids = input_ids[b]
 
-            # Find <|seg|> positions — each marks the END of a texture block
-            seg_positions = (ids == self.seg_token_id).nonzero(as_tuple=True)[0]
+            # V7: locate assistant content start FIRST so we can filter
+            # prompt-template <|seg|> occurrences out before building blocks.
+            asst_content_start = self._find_asst_start(ids, im_start_id)
+
+            all_seg = (ids == self.seg_token_id).nonzero(as_tuple=True)[0]
+            seg_positions = all_seg[all_seg >= asst_content_start]
             K = seg_positions.shape[0]
             if K < 2:
                 continue  # 0-1 textures → no cross-block leakage possible
-
-            # Find where assistant content begins.
-            # In Qwen3-VL chat template: ...<|im_start|>assistant\nTEXTURE_1: ...
-            # The last <|im_start|> before the first <|seg|> marks the assistant turn.
-            first_seg = seg_positions[0].item()
-            im_starts = (ids == im_start_id).nonzero(as_tuple=True)[0]
-            asst_content_start = 0
-            for pos in reversed(im_starts.tolist()):
-                if pos < first_seg:
-                    # Skip past "<|im_start|>assistant\n" — typically 3-4 tokens.
-                    # Scan forward for the newline token that ends the header.
-                    asst_content_start = pos + 1
-                    for skip_pos in range(pos + 1, min(pos + 8, L)):
-                        tok_str = self.processor.tokenizer.decode(
-                            [ids[skip_pos].item()], skip_special_tokens=False,
-                        )
-                        if "\n" in tok_str:
-                            asst_content_start = skip_pos + 1
-                            break
-                    break
 
             # Build texture block boundaries:
             # Block k spans from block_start to seg_positions[k] (inclusive).
@@ -359,15 +312,39 @@ class Qwen2SAMDeTexture(nn.Module):
                                  device=hidden_states.device,
                                  dtype=hidden_states.dtype)
         k_preds = torch.zeros(B, dtype=torch.long, device=hidden_states.device)
+        im_start_id = self.processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
 
         for b in range(B):
-            positions = (input_ids[b] == self.seg_token_id).nonzero(as_tuple=True)[0]
+            ids = input_ids[b]
+            # V7: filter SEG positions to the assistant region. Prompt template
+            # contains literal "<|seg|>" which tokenises to the SEG special
+            # token — those occurrences must not be mistaken for real outputs.
+            asst_start = self._find_asst_start(ids, im_start_id)
+            all_positions = (ids == self.seg_token_id).nonzero(as_tuple=True)[0]
+            positions = all_positions[all_positions >= asst_start]
             k = min(len(positions), MAX_TEXTURES)
             for i in range(k):
                 seg_embeds[b, i] = hidden_states[b, positions[i]]
             k_preds[b] = k
 
         return seg_embeds, k_preds
+
+    def _find_asst_start(self, ids: torch.Tensor, im_start_id: int) -> int:
+        """Index of the first assistant-content token (last <|im_start|> + header)."""
+        L = ids.shape[0]
+        im_starts = (ids == im_start_id).nonzero(as_tuple=True)[0]
+        if len(im_starts) == 0:
+            return 0
+        last = int(im_starts[-1].item())
+        asst_start = last + 1
+        for skip in range(last + 1, min(last + 8, L)):
+            tok_str = self.processor.tokenizer.decode(
+                [int(ids[skip].item())], skip_special_tokens=False,
+            )
+            if "\n" in tok_str:
+                asst_start = skip + 1
+                break
+        return asst_start
 
     # ------------------------------------------------------------------ #
     #  Query slot assembly                                                 #
@@ -521,8 +498,8 @@ class Qwen2SAMDeTexture(nn.Module):
         # Build query slots [DUSTBIN, SEG_1..MAX]
         query_embeds, pad_mask = self.build_query_slots(seg_embeds, k_preds)
 
-        # Bottleneck Projection → (B, 7, 256)
-        query_256 = self.projector(query_embeds)
+        # V7: Bridge (4096 → 1024) then SAM's frozen resizer (1024 → 256)
+        query_256 = self._sam_resizer(self.bridge(query_embeds))
 
         # SAM3 backbone (frozen)
         with torch.no_grad():
@@ -647,9 +624,12 @@ class Qwen2SAMDeTexture(nn.Module):
             k_preds = torch.zeros(B, dtype=torch.long, device=full_hidden.device)
 
             for b in range(B):
-                # First try <|seg|> lookup for this specific sample
-                seg_pos = (generated_ids[b] == self.seg_token_id).nonzero(
+                # V7: filter to generated-region seg tokens only; prompt
+                # template contains literal <|seg|> which tokenises to the
+                # special SEG token and would otherwise be counted here.
+                all_seg = (generated_ids[b] == self.seg_token_id).nonzero(
                     as_tuple=True)[0]
+                seg_pos = all_seg[all_seg >= prompt_len]
                 if len(seg_pos) > 0:
                     k = min(len(seg_pos), MAX_TEXTURES)
                     for i in range(k):
@@ -695,7 +675,8 @@ class Qwen2SAMDeTexture(nn.Module):
 
         # ---- SAM3 pipeline ----------------------------------------------- #
         query_embeds, pad_mask = self.build_query_slots(seg_embeds, k_preds)
-        query_256 = self.projector(query_embeds)
+        # V7 Bridge (4096 → 1024) then SAM's frozen resizer (1024 → 256)
+        query_256 = self._sam_resizer(self.bridge(query_embeds))
 
         backbone_out = self.sam3.backbone.forward_image(sam_images)
         backbone_out["img_batch_all_stages"] = sam_images
@@ -715,68 +696,46 @@ class Qwen2SAMDeTexture(nn.Module):
     # ------------------------------------------------------------------ #
 
     def get_parameter_groups(self, base_lr: float) -> list:
-        """
-        V5 parameter groups with Differential Learning Rates.
+        """V7 parameter groups.
 
-        - Qwen LoRA:  conservative LR (base * qwen_lr_scale, e.g. 2e-5)
-                       to prevent yanking pretrained weights. Frozen in
-                       Stage 1 via requires_grad=False; optimizer skips.
-        - Projector:   full base LR (e.g. 1e-4). Needs to learn fast
-                       during warmup to escape random init.
+        - Qwen LoRA:  conservative LR (base * qwen_lr_scale = 1e-6).
+                       Frozen in Stage 1; unfrozen at Stage 2.
+        - Bridge:     full base LR (1e-4). Decayed 10× at Stage 2 entry.
         - Mask head + dustbin: full base LR.
-        - SAM LoRA:    scaled LR (base * sam3_lr_scale). Frozen in
-                       Stages 1-2 via requires_grad=False.
+        - SAM3:       100% frozen permanently — no LoRA group.
         """
-        sam3_lr_scale = self.cfg["model"].get("sam3_lr_scale", 0.1)
-        qwen_lr_scale = self.cfg["model"].get("qwen_lr_scale", 0.2)
+        qwen_lr_scale = self.cfg["model"].get("qwen_lr_scale", 0.01)
 
-        # Qwen LoRA params (includes frozen — optimizer skips them)
         qwen_lora_params = [
             p for n, p in self.qwen.named_parameters()
             if "lora" in n.lower()
         ]
 
-        proj_params = list(self.projector.parameters())
+        bridge_params = list(self.bridge.parameters())
         mask_head_params = list(self.mask_head.parameters())
         dustbin_params = [self.dustbin_embed]
 
-        sam3_lora_params = []
-        for m in self.sam3_lora_modules:
-            sam3_lora_params.extend([m.lora_A, m.lora_B])
-
-        groups = [
+        return [
             {"params": qwen_lora_params,
              "lr": base_lr * qwen_lr_scale, "name": "qwen_lora"},
-            {"params": proj_params, "lr": base_lr, "name": "projector"},
+            {"params": bridge_params, "lr": base_lr, "name": "bridge"},
             {"params": mask_head_params, "lr": base_lr, "name": "mask_head"},
             {"params": dustbin_params, "lr": base_lr, "name": "dustbin"},
         ]
-        if sam3_lora_params:
-            groups.append({
-                "params": sam3_lora_params,
-                "lr": base_lr * sam3_lr_scale,
-                "name": "sam3_orth_lora",
-            })
-        return groups
 
     def num_trainable_params(self) -> dict:
         qwen_lora_n = sum(
             p.numel() for n, p in self.qwen.named_parameters()
             if p.requires_grad and "lora" in n.lower()
         )
-        proj_n = sum(p.numel() for p in self.projector.parameters())
+        bridge_n = sum(p.numel() for p in self.bridge.parameters())
         mask_head_n = sum(p.numel() for p in self.mask_head.parameters())
         dustbin_n = self.dustbin_embed.numel()
-        sam3_lora_n = sum(
-            p.numel() for m in self.sam3_lora_modules
-            for p in [m.lora_A, m.lora_B]
-        )
-        total = qwen_lora_n + proj_n + mask_head_n + dustbin_n + sam3_lora_n
+        total = qwen_lora_n + bridge_n + mask_head_n + dustbin_n
         return {
             "qwen_lora": qwen_lora_n,
-            "projector": proj_n,
+            "bridge": bridge_n,
             "mask_head": mask_head_n,
             "dustbin": dustbin_n,
-            "sam3_orth_lora": sam3_lora_n,
             "total_trainable": total,
         }

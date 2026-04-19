@@ -1,8 +1,10 @@
-# Qwen2SAM-DeTexture
+# Qwen2SAM-DeTexture (V7)
 
 **End-to-End VLM-Guided Multi-Texture Segmentation with [SEG] Token Grounding**
 
-An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a Geometric Segmentation Engine (**SAM 3**) to segment images into 1-6 distinct texture regions. The model uses a dedicated **[SEG] token** to decouple visual grounding from language context, a **block-diagonal attention mask** to prevent cross-texture contamination, and a **bottleneck projector** (~2M params) that forces domain-agnostic generalization.
+An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a Geometric Segmentation Engine (**SAM 3**) to segment images into 1-6 distinct texture regions. The model uses a dedicated **[SEG] token** to decouple visual grounding from language context, a **block-diagonal attention mask** to prevent cross-texture contamination, and the **V7 Bridge** — a trainable projection into SAM 3's *native* text-encoder space that then reuses SAM's own frozen 1024 → 256 resizer, so Qwen's semantic richness is shape-matched into SAM instead of being squashed through a learned bottleneck.
+
+This README documents V7, the current architecture. See [ablation/](ablation/) for the full V1 → V7 evolution and the pathologies each version resolved.
 
 ---
 
@@ -12,20 +14,19 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
 - [Architecture Overview](#architecture-overview)
 - [Detailed Architecture](#detailed-architecture)
   - [Module A: Qwen3-VL with [SEG] Token](#module-a-qwen3-vl-with-seg-token)
-  - [Module B: Bottleneck Projector](#module-b-bottleneck-projector)
+  - [Module B: V7 Bridge + Frozen SAM Resizer](#module-b-v7-bridge--frozen-sam-resizer)
   - [Module C: SAM 3 with Batch Multiplexing](#module-c-sam-3-with-batch-multiplexing)
   - [Module D: Multi-Texture Mask Head](#module-d-multi-texture-mask-head)
 - [The Dustbin Query](#the-dustbin-query)
 - [Block-Diagonal Attention Mask](#block-diagonal-attention-mask)
-- [Loss Masking (Anti-Count-Collapse)](#loss-masking-anti-count-collapse)
-- [Orthogonal LoRA](#orthogonal-lora)
+- [Exponential LM Loss (V7)](#exponential-lm-loss-v7)
 - [Training Process](#training-process)
-  - [Three-Stage Curriculum](#three-stage-curriculum)
+  - [Two-Stage Curriculum](#two-stage-curriculum)
   - [Forward Pass Walkthrough](#forward-pass-walkthrough)
   - [Loss Functions](#loss-functions)
   - [Differential Learning Rates](#differential-learning-rates)
 - [Inference (Two-Pass Strategy)](#inference-two-pass-strategy)
-- [Ablation History (V1-V5)](#ablation-history-v1-v5)
+- [Ablation History (V1-V7)](#ablation-history-v1-v7)
 - [Project Structure](#project-structure)
 - [Configuration](#configuration)
 - [Getting Started](#getting-started)
@@ -37,13 +38,14 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
 | Innovation | What it solves |
 |---|---|
 | **[SEG] Token Grounding** | Dedicated `<\|seg\|>` token after each texture description. Qwen's LoRA learns to pack visually-grounded spatial information into this token, decoupling it from noisy language context. |
+| **V7 Bridge to SAM's Native Width** | `Linear(4096 → 1024) + LayerNorm + GELU + Dropout(0.4)` maps Qwen [SEG] into SAM 3's native 1024-D text-encoder space; SAM's *frozen* pretrained resizer (`Linear 1024 → 256`) handles the final projection. Replaces V6's 4096→512→256 bottleneck that was squashing Qwen's semantic richness. |
 | **Block-Diagonal Attention Mask** | Prevents Context Leakage: TEXTURE_2's `<\|seg\|>` hidden state cannot attend to TEXTURE_1's tokens. Proven to reduce inter-texture cosine similarity from 0.74 to 0.16. |
-| **Proximity-Decayed LM Regularization** | Per-token cosine-decayed LM loss weight: full linguistic anchor at block start, geometric freedom near `[SEG]`. Prevents both Count Collapse (from uniform LM loss) and Language Collapse (from binary masking). |
-| **Information Bottleneck (2M params)** | Projector reduced from 10.5M to 2.1M params. Ablation proved that larger projectors memorize domain-specific manifold directions (Directional Drift). The bottleneck forces generalization. |
+| **Exponential LM Regularization (V7)** | Per-token weight `Weight(d) = 1 − e^(−2d)` where `d` = distance to nearest assistant-region `<\|seg\|>`. Weight at the SEG token is *strictly zero* (total geometric freedom); weight at d≥3 is ≈1.0 (full linguistic anchoring). Replaces V6's cosine schedule; eliminates the DICE ↔ LM tug-of-war. |
 | **Batch Multiplexing** | Each query is fed to SAM independently in its own "slot 1" position. Eliminates SAM3's pretrained positional bias where only the first query slot received attention. |
 | **Dustbin Query** | A learned embedding that absorbs non-texture pixels (objects, sky, etc.), preventing false texture assignments. |
-| **Orthogonal LoRA** | Fine-tunes SAM3's cross-attention without catastrophic forgetting. LoRA updates are regularized to be orthogonal to SAM3's pretrained weight subspace. |
-| **Three-Stage Curriculum** | Cold Start Protection: (1) Projector warmup, (2) Qwen LoRA at conservative LR, (3) SAM LoRA end-to-end. Prevents garbage gradients from a random projector corrupting Qwen's pretrained weights. |
+| **Permanent SAM Freeze (V7)** | SAM stays 100% frozen. Zero-Shot SAM 3 with an object-aware prompt hit **0.928 mIoU** on RWTD — fine-tuning only destroys this OOD generality. V5/V6 confirmed this: every SAM LoRA unfreezing attempt produced an OOD regression. |
+| **Two-Stage Curriculum (V7)** | (1) Bridge warmup (Qwen + SAM frozen), (2) Qwen LoRA thaw at 1e-6 with Bridge LR decayed 10×. No Stage 3. Removes the regression locus from V5/V6. |
+| **Universal Object-Aware Prompt** | Same prompt for training and inference: "a prominent foreground object and its background, or contrasting materials" — matches the object-aware framing that unlocked the 0.928 ZS SAM result on RWTD. |
 | **Two-Pass Inference** | Pass 1: standard causal generation (no repetition). Pass 2: block-diagonal masked forward (decoupled [SEG] extraction). Train-test parity guaranteed. |
 
 ---
@@ -88,26 +90,32 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
                   |                                  |
                   v                                  |
     +----------------------------+                   |
-    |  MODULE B: Bottleneck      |                   |
-    |  Projector (~2M params)    |                   |
+    |  MODULE B: V7 Bridge       |                   |
+    |  (4.2M trainable params)   |                   |
     |                            |                   |
-    |  4096 -> 512 + LN + GELU   |                    |
-    |    + Dropout(0.15)         |                   |
-    |  512  -> 256               |                   |
+    |  Linear(4096 -> 1024) + LN |                   |
+    |   + GELU + Dropout(0.4)    |                   |
+    +-------------+--------------+                   |
+                  |                                  |
+                  v                                  |
+    +----------------------------+                   |
+    |  SAM.resizer (FROZEN)      |                   |
+    |  Linear(1024 -> 256)       |                   |
+    |  reused from SAM3's own    |                   |
+    |  language_backbone         |                   |
     +-------------+--------------+                   |
                   |                                  |
                   +----------------------------------+
                   |                                  |
                   v                                  v
     +-------------------------------------------------------+
-    |  MODULE C: SAM3 — Batch Multiplexed                    |
-    |  (B, 7, 256) -> flatten -> (B*7, 1, 256)               |
-    |  Each query gets its own "slot 1" position             |
-    |                                                        |
-    |  Fusion Encoder (frozen + Orthogonal LoRA)             |
-    |  SegHead cross_attend_prompt (frozen + Orth. LoRA)     |
-    |  Pixel Decoder (frozen) -> pixel_embed                 |
-    +----------------------------+---------------------------+
+    |  MODULE C: SAM3 — Batch Multiplexed (FROZEN)          |
+    |  (B, 7, 256) -> flatten -> (B*7, 1, 256)              |
+    |  Each query gets its own "slot 1" position            |
+    |                                                       |
+    |  Fusion Encoder  |  Cross-Attn  |  Pixel Decoder      |
+    |  (all frozen — no LoRA in V7)                         |
+    +----------------------------+--------------------------+
                                  |
                                  v
     +-------------------------------------------------------+
@@ -128,7 +136,7 @@ An E2E architecture that fuses a Vision-Language Model (**Qwen3-VL-8B**) with a 
 
 **Model**: `Qwen/Qwen3-VL-8B-Instruct`
 **Status**: Frozen base weights + LoRA (r=8) on `q_proj` and `v_proj`.
-**Training**: LoRA receives gradients ONLY through `<|seg|>` token positions (loss masking).
+**Training**: LoRA receives gradients through the spatial path (mask loss → SAM → Bridge → [SEG]) AND linguistic supervision via the V7 exponential LM cliff.
 
 **Output format** (teacher-forced during training):
 ```
@@ -139,20 +147,27 @@ TEXTURE_3: Texture of dry sandy ground with ripple patterns on the right <|seg|>
 
 The `<|seg|>` token is a dedicated grounding anchor. Unlike natural language end-of-line tokens (which absorb context from ALL prior tokens via causal attention), `<|seg|>` hidden states are computed under a **block-diagonal attention mask** that isolates each texture block from previous blocks. This produces clean, decoupled visual representations.
 
+**V7 prompt change**: both SYSTEM and USER prompts include an object-aware example ("a prominent foreground object and its background, or contrasting materials"), and the format template explicitly shows `<|seg|>` per TEXTURE line. Because the prompt contains literal `<|seg|>` text which tokenises as the SEG special token, all seg-position lookups filter by the assistant-region boundary.
+
 ---
 
-### Module B: Bottleneck Projector
+### Module B: V7 Bridge + Frozen SAM Resizer
 
-**Status**: Fully trainable (~2.1M params).
-
-Maps `<|seg|>` hidden states from Qwen's 4096-D space to SAM3's 256-D query space through a deliberately constrained bottleneck:
+**V7 replaces V6's bottleneck projector with a wider trainable Bridge followed by SAM's own frozen resizer.**
 
 ```
-Linear(4096 -> 512) + LayerNorm(512) + GELU + Dropout(0.15)
-Linear(512  -> 256)
+Bridge (trainable, ~4.2M params):
+    Linear(4096 -> 1024) + LayerNorm(1024) + GELU + Dropout(0.4)
+
+Then:
+    SAM.backbone.language_backbone.resizer (FROZEN, Linear 1024 -> 256)
 ```
 
-**Why so small?** Ablation studies proved that a larger projector (10.5M params) memorizes domain-specific manifold directions that don't generalize to unseen domains (Directional Drift). Reducing to ~2M params eliminated the drift entirely and produced the first trained model to surpass the zero-shot baseline.
+**Why**: V1–V6 all projected through a 256-dim square bottleneck, compressing Qwen's rich 4096-D `[SEG]` representation ~16×. A parallel Zero-Shot SAM 3 experiment using a highly descriptive, object-aware prompt (no VLM, no projector, raw text path) achieved **0.928 mIoU on RWTD**. SAM natively understands complex semantic descriptions; the limiter was our projector squashing Qwen's vocabulary before SAM could see it.
+
+V7's fix: widen the trainable projection into SAM's **native** text-encoder width (1024-D), then hand the final 1024→256 step back to SAM's own pretrained `resizer` layer, kept frozen. The Bridge's job is shape-matching, not semantic translation — SAM's pretrained resizer already knows that map.
+
+**Dropout(0.4)** is load-bearing. At 4.2M params (2× V6) without heavy dropout, the Directional Drift pathology from V4 (10.5M projector memorising ADE20K directions) would reappear.
 
 ---
 
@@ -166,12 +181,15 @@ Each of the 7 query vectors is fed to SAM **independently** by flattening the qu
 
 This eliminates SAM3's pretrained positional bias (V2 ablation: Slot 1 received 90.5% of pixels, Slot 2 received 0.0%). Image features are indexed via `image_ids` (no memory copy).
 
-| Component | Status | Role |
+| Component | Status in V7 | Role |
 |---|---|---|
 | Image Encoder (ViT) | **Frozen** | Multi-scale visual features (FPN) |
-| Fusion Encoder | **Frozen + Orthogonal LoRA** | Cross-attends image features with queries |
-| `cross_attend_prompt` | **Frozen + Orthogonal LoRA** | Enriches encoder hidden states |
+| Fusion Encoder | **Frozen** (no LoRA) | Cross-attends image features with queries |
+| `cross_attend_prompt` | **Frozen** (no LoRA) | Enriches encoder hidden states |
 | Pixel Decoder | **Frozen** | Dense pixel embeddings (B, 256, H, W) |
+| `language_backbone.resizer` | **Frozen** (reused by Bridge) | Linear(1024, 256) — semantic channel Qwen→SAM |
+
+**V7 has no SAM LoRA.** V5 and V6 both tried to fine-tune SAM (orthogonal LoRA in cross-attention); both produced OOD regression on RWTD. With the ZS ceiling at 0.928, training SAM at all is net-negative.
 
 ---
 
@@ -218,44 +236,46 @@ All blocks can attend to the shared prefix (system + image + user prompt). Withi
 
 ---
 
-## Proximity-Decayed LM Regularization
+## Exponential LM Loss (V7)
 
-Binary loss masking creates a binary failure: uniform LM loss causes Count Collapse (model terminates after one texture); zero LM loss causes Language Collapse (LoRA forgets how to generate text). Our solution is a **continuous cosine-decayed weight** per token within each texture block:
+V6's cosine-decayed LM schedule kept loss pressure ~0.5 across most of each block, producing a constant tug-of-war between DICE (wants geometric freedom on `[SEG]`) and LM (wants linguistic fidelity on every text token). V6 DICE plateaued at 0.43.
+
+V7 replaces the cosine with a sharp exponential **cliff**:
 
 ```
-TEXTURE_1: Texture of rough stone in the foreground <|seg|>
-Weight:    [1.0    0.95   0.82  0.65  0.45  0.25  0.12  0.05  0.05]
-           ↑ linguistic anchor                          ↑ geometric freedom
+Weight(d) = 1 − exp(−α · d),   α = 2.0
 ```
 
-$$\lambda(i) = \lambda_{\min} + \frac{1}{2}(\lambda_{\max} - \lambda_{\min})(1 + \cos(\pi \cdot \tau))$$
+where `d` is the token-wise distance to the nearest assistant-region `<|seg|>`.
 
-- **Block start** (τ=0, λ=1.0): Full LM supervision — anchors language quality
-- **Near `<|seg|>`** (τ=1, λ=0.05): Minimal LM — spatial gradient dominates
+| Distance | Weight |
+|---|---|
+| d = 0 (the SEG token) | **0.000** (strictly zero — total geometric freedom) |
+| d = 1 | 0.865 |
+| d = 2 | 0.982 |
+| d = 3 | 0.998 |
+| d ≥ 4 | ≈ 1.0 (full LM supervision) |
+
+The grounding token is geometrically free; every other text token is under near-full linguistic anchoring. Prompt-side `<|seg|>` tokens (from the V7 format template) are filtered out of the distance calculation — only real assistant-region SEGs count.
 
 ---
 
-## Orthogonal LoRA
+## Orthogonal LoRA (retired in V7)
 
-Applied to SAM3's cross-attention layers. Constrains weight updates to directions orthogonal to SAM3's pretrained dominant singular vectors:
-
-```
-L_orth = || U_k^T @ (B @ A) ||_F^2
-```
-
-This preserves SAM3's zero-shot segmentation capability while adapting to texture-specific features.
+V5 and V6 applied Orthogonal LoRA to SAM3's cross-attention to enable constrained fine-tuning. V7 removes SAM LoRA entirely. The ZS SAM 3 breakthrough and V6's Stage-3 RWTD regression both show that any SAM training hurts OOD generalisation relative to the pretrained weights. The mechanism is retained in the codebase (`models/orthogonal_lora.py`) for reference but is never instantiated.
 
 ---
 
 ## Training Process
 
-### Three-Stage Cold-Start Curriculum
+### Two-Stage Curriculum
 
-| Stage | Epochs | Trainable | Frozen | Purpose |
+| Stage | Epochs | Trainable | Frozen | Key event |
 |---|---|---|---|---|
-| **1. Projector Warmup** | 1-5 | Projector + mask head + dustbin | Qwen LoRA, SAM LoRA | Projector escapes random init, builds stable mapping |
-| **2. Co-Adaptation** | 6-10 | + Qwen LoRA (1e-6, ultra-conservative) | SAM LoRA | LoRA refines [SEG] representations carefully |
-| **3. End-to-End** | 11+ | + SAM LoRA | — | Full joint convergence, "private language" develops |
+| **1. Bridge Warmup** | 1-12 | Bridge (1e-4) + mask head + dustbin | Qwen LoRA, SAM (full) | Bridge learns to route Qwen's 4096-D into SAM's 1024-D native space |
+| **2. Qwen Sync + Bridge Decay** | 13-20 | + Qwen LoRA (1e-6). **Bridge LR decayed 10× → 1e-5** | SAM (full) | Qwen LoRA builds on a slowed-down Bridge; exponential LM keeps language stable |
+
+SAM is permanently frozen across all stages (no Stage 3).
 
 ### Forward Pass Walkthrough
 
@@ -263,49 +283,49 @@ This preserves SAM3's zero-shot segmentation capability while adapting to textur
 Step 1: Qwen Forward (teacher forcing with <|seg|> tokens)
   |  Image + prompt + "TEXTURE_1: desc <|seg|>\nTEXTURE_2: desc <|seg|>"
   |  Block-diagonal attention mask applied
-  |  -> hidden_states + lm_loss (only on <|seg|> positions)
+  |  -> hidden_states + qwen_logits (for exponential-LM weighted CE)
   |
 Step 2: Extract <|seg|> Hidden States
-  |  Clean token lookup (no regex, no position arithmetic)
+  |  Clean token lookup filtered to assistant region (V7 prompt contains literal <|seg|>)
   |  K vectors of dim 4096, each decoupled from other texture blocks
   |
 Step 3: Build 7 Query Slots
   |  [DUSTBIN, SEG_1, ..., SEG_K, PAD, ..., PAD]
   |
-Step 4: Bottleneck Projection
-  |  (B, 7, 4096) -> (B, 7, 256)
+Step 4: Bridge + frozen SAM resizer
+  |  Bridge(4096 -> 1024) + SAM.resizer(1024 -> 256)
+  |  -> (B, 7, 256)
   |
-Step 5: SAM3 Batch Multiplexed
+Step 5: SAM3 Batch Multiplexed (frozen)
   |  (B, 7, 256) -> (B*7, 1, 256) -> Fusion Encoder -> Pixel Decoder
   |  -> (B, 7, H, W) mask logits
   |
 Step 6: Loss
   |  Mask: CE + heavy Dice (weight 3.0) on pixel predictions
-  |  LM: Proximity-decayed CE (λ=1.0 at block start → 0.05 near [SEG])
-  |  Orth: regularization on SAM LoRA
+  |  LM: Exponential-cliff weighted CE (w=0 at [SEG], w≈1 elsewhere)
 ```
 
 ### Loss Functions
 
 ```
-L_total = mask_weight * (CE + 3.0 * Dice) + lm_weight * LM_decayed + orth_weight * L_orth
+L_total = mask_weight * (CE + 3.0 * Dice) + lm_weight * LM_exponential
 ```
 
 | Loss | Weight | Notes |
 |---|---|---|
 | **Cross-Entropy** | 1.0 | Pixel-wise, PAD channels = -inf |
 | **Dice** | 3.0 | Per-channel, PAD excluded |
-| **LM (proximity-decayed)** | 0.1 | Cosine-decayed per token — linguistic anchor at start, geometric freedom at [SEG] |
-| **Orthogonal Reg** | 0.01 | SAM LoRA stays in null space of pretrained weights |
+| **LM (exponential cliff)** | 0.1 | `Weight(d) = 1 − e^(−2d)`; SEG token itself at 0 |
+| ~~Orthogonal Reg~~ | 0.0 | Retired in V7 (no SAM LoRA) |
 
-### Differential Learning Rates
+### Differential Learning Rates (stage-dependent)
 
-| Component | LR | Ratio | Notes |
-|---|---|---|---|
-| Projector (2.1M) | 1e-4 | 1.0x | Randomly initialised — needs fast learning |
-| Mask Head + Dustbin | 1e-4 | 1.0x | Task-specific |
-| Qwen LoRA (3.8M) | 1e-6 | 0.01x | Ultra-conservative — minimal perturbation of 8B pretrained weights |
-| SAM3 Orth LoRA (0.3M) | 1e-5 | 0.1x | Frozen in Stages 1-2 |
+| Component | Stage 1 (1-12) | Stage 2 (13-20) |
+|---|---|---|
+| Bridge (4.2M) | 1e-4 | **1e-5** (decayed 10×) |
+| Mask Head + Dustbin | 1e-4 | 1e-4 |
+| Qwen LoRA (3.8M) | frozen | 1e-6 (0.01×) |
+| SAM (full) | frozen | frozen |
 
 ---
 
@@ -320,28 +340,35 @@ Pass 2 — Extraction (block-diagonal mask):
   The FULL generated sequence is re-run through Qwen with the
   block-diagonal custom mask. Each <|seg|> hidden state is computed
   in isolation from other texture blocks — matching training conditions.
+  Only assistant-region <|seg|> tokens count (prompt-side ones filtered).
 
   If <|seg|> tokens are not yet emitted (early training), a regex
-  fallback extracts from TEXTURE_N: line-end positions in Pass 1.
+  fallback extracts from TEXTURE_N: line-end positions in Pass 1,
+  also filtered to the generated region (>= prompt_len).
 ```
 
 This two-pass approach guarantees train-test parity while preserving generation quality.
 
 ---
 
-## Ablation Findings
+## Ablation History (V1-V7)
 
 Each architectural component was motivated by a specific pathology discovered through rigorous ablation:
 
-| Pathology | Discovery | Fix | Impact |
+| Version | Key change | RWTD mIoU (best honest) | Pathology resolved / failure |
 |---|---|---|---|
-| **Slot-1 Positional Bias** | SAM allocates 90.5% of pixels to slot 1, 0.0% to slot 2 | Batch Multiplexing | +0.16 mIoU |
-| **Count Collapse** | Uniform LM loss → model terminates after 1 texture (85% of samples) | Teacher forcing + proximity-decayed LM | Correct k_pred distribution restored |
-| **Directional Drift** | 10.5M projector memorises domain-specific manifold directions | Information Bottleneck (2.1M) | +0.04 mIoU, first to beat ZS baseline |
-| **Context Leakage** | Causal attention inflates inter-texture cosine from 0.16 to 0.74 | Block-diagonal attention mask | Decoupled [SEG] representations |
-| **Language Collapse** | Binary loss masking (-100 on text) → LoRA catastrophic forgetting | Proximity-decayed regularization | Language + grounding preserved simultaneously |
+| V1 | Initial VLM + SAM wiring | 0.678 | Qwen LoRA overfitting |
+| V2 | Query-slot design | 0.695 | **Slot-1 Addiction** discovered |
+| V3 | LLM co-training | 0.703 | Count Collapse + projector drift + SAM regression |
+| V4 | 10.5M projector | 0.692 | **Directional Drift** (memorises ADE20K directions) |
+| V4-Slim | Bottleneck 2.1M | 0.732 | **First to beat ZS baseline** |
+| V5-Oracle | Block-diagonal mask | 0.810 (Oracle) | Geometry-only ceiling; language collapsed in live |
+| V5-Live | | 0.136 | **Language Collapse** — LoRA forgot language |
+| V6 | Proximity-decayed LM | 0.694 (live exactly_2) | Language preserved; **Latent Co-Adaptation Churn** in Stage 3 |
+| ZS SAM 3 (object-aware prompt) | No training | **0.928** | Reframed the ceiling: SAM natively understands object-aware descriptions |
+| **V7** | **Bridge + frozen resizer + exponential LM + SAM frozen forever** | **target ≥ 0.80** | Closes the projector bottleneck; eliminates Stage-3 regression |
 
-Full ablation data: `ablation/v1/` through `ablation/v5/`
+Full ablation data: `ablation/v1/` through `ablation/v7/`.
 
 ---
 
@@ -351,38 +378,43 @@ Full ablation data: `ablation/v1/` through `ablation/v5/`
 Qwen2SAM_DeTexture/
 |
 +-- configs/
-|   +-- detexture.yaml              # Main training config
-|   +-- detexture_v4_slim.yaml      # Ablation: bottleneck bridge experiment
+|   +-- detexture.yaml              # Main V7 training config
 |
 +-- models/
-|   +-- qwen2sam_detexture.py       # Main model (SEG token, block mask, two-pass inference)
-|   +-- qwen2sam_v4_slim.py         # Ablation: bottleneck bridge model
-|   +-- projector.py                # Bottleneck projector (4096->512->256)
-|   +-- orthogonal_lora.py          # Orthogonal LoRA wrapper
-|   +-- losses.py                   # Losses (mask + proximity-decayed LM + orth)
+|   +-- qwen2sam_detexture.py       # Main model (SEG token, block mask, two-pass inference, Bridge + frozen resizer)
+|   +-- bridge.py                   # V7 Bridge (Linear 4096 -> 1024 + LN + GELU + Dropout 0.4)
+|   +-- projector.py                # V5/V6 bottleneck projector (retained for reference)
+|   +-- orthogonal_lora.py          # Retired in V7 (retained for reference; never instantiated)
+|   +-- losses.py                   # Losses (mask + exponential-weighted LM)
 |
 +-- data/
-|   +-- dataset.py                  # DeTextureDataset + collator (<|seg|> + proximity-decayed labels)
+|   +-- dataset.py                  # DeTextureDataset + collator (V7 prompts, exponential lm_weights)
 |
 +-- training/
-|   +-- train.py                    # Training loop (3-stage cold-start curriculum)
-|   +-- train_v4_slim.py            # V4-Slim training loop
-|   +-- monitor.py                  # Sanity checker, logger, plotter, test evaluator
+|   +-- train.py                    # V7 two-stage training loop (decay_bridge_lr at Stage 2)
+|   +-- monitor.py                  # Sanity checker, logger, plotter, live test evaluator
 |   +-- utils.py                    # Config, seed, scheduler, checkpointing
 |
 +-- scripts/
-|   +-- analyze_vector_collapse.py  # Pre/post projector cosine similarity analysis
-|   +-- analyze_visual_bias.py      # Orthogonal subspace projection (INSID3-inspired)
-|   +-- ablation_live_ade20k.py     # Control group: live inference on in-domain data
-|   +-- ablation_k2_only.py         # Prompt count ablation (1-to-6 vs exactly-2)
-|   +-- generate_gt_embeds_v4.py    # GT embedding regeneration (V4 train/test alignment)
-|   +-- inspect_sam3_text_encoder.py # SAM3 text encoder architecture probe
+|   +-- ablation_exact_k2_rwtd.py          # RWTD prompt-constraint ablation
+|   +-- ablation_object_friendly_prompt.py # Object-friendly prompt variant
+|   +-- ablation_structured_prompt_ep10_vs_ep18.py  # ep10 vs ep18 structured-prompt test
+|   +-- ablation_short_length_ep10.py      # Length-cap sensitivity test
+|   +-- consolidate_structured_ablation_texts.py    # Merge GT + generations per checkpoint
+|   +-- test_on_dataset.py                 # Generic live-inference driver
+|   +-- eval_rwtd_oracle.py                # Oracle-mode evaluator
+|   +-- analyze_vector_collapse.py         # Pre/post projector cosine analysis
+|   +-- analyze_visual_bias.py             # Orthogonal subspace projection
 |
 +-- ablation/
-|   +-- v1/ v2/ v3/ v4/ v5/         # Per-version ablation studies + analyses
+|   +-- v1/ v2/ v3/ v4/ v5/ v6/ v7/  # Per-version ablation studies + analyses
 |   +-- vector_collapse_analysis.json
 |   +-- visual_bias_analysis.json
 |   +-- live_ade20k_control.json
+|
++-- checkpoints/
+|   +-- archive_v6/                 # All prior V6 .pt files (pre-V7 baseline)
+|   +-- logs/  plots/  test_results/  (populated during training)
 ```
 
 ---
@@ -394,26 +426,25 @@ model:
   qwen_model: "Qwen/Qwen3-VL-8B-Instruct"
   lora_r: 8                       # Qwen LoRA rank
   lora_alpha: 16
-  qwen_lr_scale: 0.01             # Qwen LR = base * 0.01 = 1e-6 (ultra-conservative)
-  projector_hidden_dim: 512       # Bottleneck dimension
-  sam3_lora_r: 32                 # SAM3 Orthogonal LoRA rank
-  sam3_lr_scale: 0.1
+  qwen_lr_scale: 0.01             # Qwen LR = base * 0.01 = 1e-6
+  projector_hidden_dim: 1024      # V7 Bridge output width (SAM3 native text width)
+  projector_dropout: 0.4          # V7 heavy dropout on Bridge
 
 curriculum:
-  projector_warmup_epochs: 5      # Stage 1: projector-only warmup
-  e2e_epoch: 10                   # Stage 3: SAM LoRA unfreezes
+  projector_warmup_epochs: 12     # Stage 1: Bridge warmup (Qwen + SAM frozen)
+  projector_lr_decay_at_stage2: 0.1  # Bridge LR x0.1 at Stage 2 entry
 
 loss:
   mask_weight: 1.0
   ce_weight: 1.0
   dice_weight: 3.0
-  lm_weight: 0.1                  # Proximity-decayed (λ=1.0 at block start → 0.05 near [SEG])
-  orthogonal_weight: 0.01
+  lm_weight: 0.1                  # Exponential cliff, alpha=2.0 (hardcoded in dataset.create_labels)
+  orthogonal_weight: 0.0          # Retired (no SAM LoRA)
 
 training:
   batch_size: 2
   gradient_accumulation_steps: 4  # Effective batch = 8
-  num_epochs: 60
+  num_epochs: 20
   learning_rate: 1.0e-4
 ```
 
@@ -461,21 +492,21 @@ python -m training.train --config configs/detexture.yaml --resume auto
 
 ```
 +-----------------------------------------------------------+
-|                    TRAINABLE COMPONENTS                   |
+|                  V7 TRAINABLE COMPONENTS                  |
 +-----------------------------------------------------------+
-| Qwen3-VL LoRA (r=8, q_proj + v_proj)    ~3.8M params      |
-| Bottleneck Projector (4096->512->256)    ~2.1M params     |
-| Multi-Texture Mask Head                  ~0.2M params     |
-| DUSTBIN embedding (4096-dim)             4,096 params     |
-| SAM3 Orthogonal LoRA (cross-attn)       ~0.3M params      |
+| Qwen3-VL LoRA (r=8, q_proj + v_proj)    3,833,856         |
+| V7 Bridge (Linear 4096->1024 + LN + Dr)  4,197,376        |
+| Multi-Texture Mask Head                    197,376        |
+| DUSTBIN embedding (4096-dim)                 4,096        |
 +-----------------------------------------------------------+
-| TOTAL TRAINABLE                          ~6.6M params     |
+| TOTAL TRAINABLE                          8,232,704 (8.23M)|
 +-----------------------------------------------------------+
 
 +-----------------------------------------------------------+
-|                      FROZEN COMPONENTS                    |
+|                   V7 FROZEN COMPONENTS                    |
 +-----------------------------------------------------------+
 | Qwen3-VL base weights                   ~8B params        |
-| SAM3 Image Encoder + Fusion + Decoder    ~300M params     |
+| SAM3 Image Encoder + Fusion + Decoder   ~300M params      |
+| SAM3 language_backbone.resizer (reused)  1024x256 + 256   |
 +-----------------------------------------------------------+
 ```

@@ -738,13 +738,17 @@ class TestEvaluator:
     def evaluate(self, model, processor, device, epoch: int,
                  **kwargs) -> dict:
         """
-        Oracle Evaluation: bypasses Qwen generation, feeds GT descriptions
-        through the training forward() path (block-diagonal mask, [SEG]
-        extraction, bottleneck projector, SAM).
+        Live-Inference Evaluation with the standard "1 to 6" prompt.
 
-        This establishes the architectural upper bound — the maximum mIoU
-        achievable when text conditioning is perfect. Used to track the
-        geometric architecture's generalization during training.
+        Uses the two-pass inference_forward() path: Qwen generates its own
+        texture descriptions from scratch (rather than teacher-forced GT
+        text). The user prompt is the default training-time "1 to 6"
+        template; the model decides the count itself. Hungarian matching
+        in _compute_matched_miou handles k_pred != k_gt.
+
+        This measures the true end-to-end pipeline performance on OOD data.
+        Over-segmentation behavior is tracked via k_pred distribution
+        and discussed transparently in the paper.
 
         Returns dict with metrics: test_miou, test_mari, per_sample_results.
         """
@@ -755,9 +759,7 @@ class TestEvaluator:
             image_size=self.image_size,
             augment=False,
         )
-        # TRAINING collator (inference=False) — includes GT assistant text
-        # with <|seg|> tokens for teacher-forced forward()
-        collator = DeTextureCollator(processor, inference=False)
+        collator = DeTextureCollator(processor, inference=True)
         test_loader = torch.utils.data.DataLoader(
             test_ds, batch_size=1, shuffle=False,
             num_workers=0, collate_fn=collator,
@@ -778,17 +780,18 @@ class TestEvaluator:
             index_masks = batch["index_masks"]  # (1, H, W)
             k_gts = batch["k_gts"]
 
-            # Oracle: use training forward() with GT text, no generation
+            # Live inference: Qwen generates, then two-pass block-diagonal
+            # mask reconstruction extracts [SEG] hidden states.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model.forward(
+                out = model.inference_forward(
                     qwen_inputs=qwen_inputs,
                     sam_images=sam_images,
-                    seg_grad_to_lm=False,
                 )
 
             mask_logits = out["mask_logits"]  # (1, C, H, W)
             pad_mask = out["pad_mask"]
             k_pred = int(out["k_preds"][0].item())
+            gen_text = out.get("generated_text", [""])[0]
 
             # WTA prediction: upsample logits to GT resolution, then argmax
             masked_logits = mask_logits.clone()
@@ -801,19 +804,16 @@ class TestEvaluator:
                     masked_logits.float(), size=(H_gt, W_gt),
                     mode="bilinear", align_corners=False,
                 )
-            pred = masked_logits[0].argmax(dim=0).cpu().numpy()  # (H_gt, W_gt)
-            gt = index_masks[0].numpy()  # (H_gt, W_gt)
+            pred = masked_logits[0].argmax(dim=0).cpu().numpy()
+            gt = index_masks[0].numpy()
             k_gt = int(k_gts[0].item())
 
-            # mIoU (with Hungarian matching for prediction-GT alignment)
             sample_iou, matched_pred = self._compute_matched_miou(pred, gt, k_pred, k_gt)
             all_ious.append(sample_iou)
 
-            # ARI (permutation-invariant, no matching needed)
             ari = _compute_ari(pred, gt)
             all_aris.append(ari)
 
-            # Save visualization
             self._save_visualization(
                 idx, epoch_dir, batch, pred, gt, sample_iou, ari, k_gt, k_pred,
             )
@@ -824,7 +824,7 @@ class TestEvaluator:
                 "ari": ari,
                 "k_gt": k_gt,
                 "k_pred": k_pred,
-                "generated_text": "(Oracle — GT descriptions used)",
+                "generated_text": gen_text,
             })
 
         test_miou = np.mean(all_ious) if all_ious else 0.0

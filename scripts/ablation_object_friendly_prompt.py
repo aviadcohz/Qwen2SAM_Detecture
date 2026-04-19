@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
-Proof of concept: "exactly 2" prompt vs "1 to 6" prompt on RWTD.
+RWTD ablation: OBJECT-FRIENDLY user prompt vs current texture-only prompt.
 
-Hypothesis: Over-segmentation (k_pred=6 when k_gt=2) is the primary
-cause of mIoU degradation on RWTD. By telling Qwen "exactly 2", we
-eliminate 4 garbage channels and let the 2 real textures dominate.
+Hypothesis: RWTD images include objects-with-textures (not pure textures like
+ADE20K-DeTexture). Our training prompt explicitly instructs Qwen to treat
+regions as "surfaces/areas, not single objects", which may be leaving RWTD
+performance on the table because the GT regions ARE often objects.
+
+This script evaluates best.pt (ep7) under a more permissive prompt that
+allows either "continuous material surface OR prominent foreground element".
+Two k-conditions per prompt to disentangle prompt framing from Hungarian
+inflation effects.
+
+Saves per-condition JSON including full Qwen-generated text for each
+sample for qualitative comparison vs GT descriptions.
 
 Usage:
-    python scripts/ablation_exact_k2_rwtd.py \
-        --checkpoint checkpoints/epoch_5.pt
+    python scripts/ablation_object_friendly_prompt.py \
+        --checkpoint checkpoints/best.pt \
+        --output-dir checkpoints/ablation_object_friendly
 """
 
 import argparse
@@ -25,26 +35,44 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from models.qwen2sam_detexture import Qwen2SAMDeTexture, MAX_TEXTURES
-from data.dataset import (
-    DeTextureDataset, DeTextureCollator,
-    SYSTEM_PROMPT, USER_PROMPT_TEMPLATE,
-)
+from data.dataset import DeTextureDataset, DeTextureCollator, SYSTEM_PROMPT
 from training.utils import load_config, load_checkpoint
 from training.monitor import _compute_ari
 from scipy.optimize import linear_sum_assignment
 
 
 # ===================================================================== #
-#  Custom collator with "exactly 2" prompt                                #
+#  Object-friendly user prompt (differs only in the IMPORTANT paragraph) #
 # ===================================================================== #
 
-class ExactKCollator(DeTextureCollator):
-    """Collator that uses 'exactly K' in the user prompt instead of '1 to 6'."""
+OBJECT_FRIENDLY_PROMPT_TEMPLATE = (
+    "This image contains exactly {N} main visually distinct regions separated "
+    "by boundaries (for example, contrasting materials, surfaces, or textures).\n\n"
+    "Write a single, highly descriptive phrase (approximately 10-15 words) for "
+    "each region. Include the following precise information:\n"
+    "1. Semantic Name: A natural, common name for the material or surface.\n"
+    "2. Distinct Visual Features: The core visual attributes like color, pattern, "
+    "or texture that strongly contrast with the other regions.\n"
+    "3. Spatial Context: A brief note on its general position (e.g., 'foreground', "
+    "'background', 'top-left', 'bottom-right', 'center', 'top-right', 'bottom-left').\n\n"
+    "IMPORTANT: Identify the {N} most prominent visually distinct regions. A region "
+    "can be a continuous material surface OR a prominent, distinct foreground element "
+    "that occupies a clear area. Describe the visual texture and pattern of each region.\n\n"
+    "Format your response exactly like this:\n"
+    "TEXTURE_1: Texture of <description>\n"
+    "TEXTURE_2: Texture of <description>\n"
+    "...\n"
+    "TEXTURE_{N}: Texture of <description>"
+)
 
-    def __init__(self, processor, k: int = 2):
+
+class ObjectFriendlyCollator(DeTextureCollator):
+    """Uses the object-friendly prompt instead of the training-time prompt."""
+
+    def __init__(self, processor, n_value: str):
         super().__init__(processor, inference=True)
-        self.k = k
-        self.user_prompt = USER_PROMPT_TEMPLATE.format(N=str(k))
+        self.n_value = n_value
+        self.user_prompt = OBJECT_FRIENDLY_PROMPT_TEMPLATE.format(N=n_value)
 
     def __call__(self, samples):
         texts, images = [], []
@@ -85,14 +113,12 @@ def compute_miou_hungarian(pred, gt, k_pred, k_gt):
             cost[pi, gi] = 1.0 - inter / max(union, 1)
     r, c = linear_sum_assignment(cost)
     ious = [1.0 - cost[ri, ci] for ri, ci in zip(r, c) if ri < k_pred and ci < k_gt]
-    return np.mean(ious) if ious else 0.0
+    return float(np.mean(ious)) if ious else 0.0
 
 
 def evaluate(model, loader, device, label):
     model.eval()
-    ious = []
-    aris = []
-    k_preds_list = []
+    ious, aris, k_preds_list = [], [], []
     per_sample = []
 
     with torch.no_grad():
@@ -107,8 +133,7 @@ def evaluate(model, loader, device, label):
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = model.inference_forward(
-                    qwen_inputs=qwen_inputs,
-                    sam_images=sam_images,
+                    qwen_inputs=qwen_inputs, sam_images=sam_images,
                 )
 
             mask_logits = out["mask_logits"]
@@ -152,8 +177,7 @@ def evaluate(model, loader, device, label):
     k_dist = Counter(k_preds_list)
 
     print(f"\n  [{label}] RESULTS:")
-    print(f"    mIoU:     {mean_iou:.4f}")
-    print(f"    mARI:     {mean_ari:.4f}")
+    print(f"    mIoU: {mean_iou:.4f}  mARI: {mean_ari:.4f}")
     print(f"    k_pred distribution: {dict(sorted(k_dist.items()))}")
     print(f"    Samples > 0.7: {sum(1 for x in ious if x > 0.7)}/{len(ious)}")
     print(f"    Samples < 0.3: {sum(1 for x in ious if x < 0.3)}/{len(ious)}")
@@ -170,16 +194,14 @@ def evaluate(model, loader, device, label):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/detexture.yaml")
-    parser.add_argument("--checkpoint", default="checkpoints/epoch_5.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--test-metadata",
                         default="/home/aviad/datasets/RWTD/metadata.json")
-    parser.add_argument("--output-dir", default=None,
-                        help="Where to save per-condition results JSON. "
-                             "Defaults to checkpoints/ablation_<ckpt_stem>/")
+    parser.add_argument("--output-dir",
+                        default="checkpoints/ablation_object_friendly")
     args = parser.parse_args()
 
-    ckpt_stem = Path(args.checkpoint).stem
-    output_dir = Path(args.output_dir or f"checkpoints/ablation_{ckpt_stem}")
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output dir: {output_dir}")
 
@@ -200,65 +222,77 @@ def main():
     )
     print(f"Test dataset: {len(test_ds)} samples")
 
-    # ---- Condition A: "1 to 6" (current default) ----------------------- #
-    print(f"\n{'='*70}")
-    print(f"  CONDITION A: prompt='1 to 6' (current default)")
-    print(f"{'='*70}")
-    collator_1to6 = DeTextureCollator(model.processor, inference=True)
-    loader_1to6 = torch.utils.data.DataLoader(
-        test_ds, batch_size=1, shuffle=False, num_workers=0,
-        collate_fn=collator_1to6,
-    )
-    res_1to6 = evaluate(model, loader_1to6, device, "1_to_6")
-    res_1to6["checkpoint"] = str(args.checkpoint)
-    with open(output_dir / "condition_A_1_to_6.json", "w") as f:
-        json.dump(res_1to6, f, indent=2)
+    # Save the prompt text itself for the record
+    (output_dir / "prompt_template.txt").write_text(OBJECT_FRIENDLY_PROMPT_TEMPLATE)
 
-    # ---- Condition B: "exactly 2" -------------------------------------- #
+    # ---- Condition A: object-friendly + "1 to 6" ----------------------- #
     print(f"\n{'='*70}")
-    print(f"  CONDITION B: prompt='exactly 2'")
+    print(f"  CONDITION A: object-friendly prompt, N='1 to 6'")
     print(f"{'='*70}")
-    collator_k2 = ExactKCollator(model.processor, k=2)
-    loader_k2 = torch.utils.data.DataLoader(
+    collator_a = ObjectFriendlyCollator(model.processor, n_value="1 to 6")
+    loader_a = torch.utils.data.DataLoader(
         test_ds, batch_size=1, shuffle=False, num_workers=0,
-        collate_fn=collator_k2,
+        collate_fn=collator_a,
     )
-    res_k2 = evaluate(model, loader_k2, device, "exactly_2")
-    res_k2["checkpoint"] = str(args.checkpoint)
-    with open(output_dir / "condition_B_exactly_2.json", "w") as f:
-        json.dump(res_k2, f, indent=2)
+    res_a = evaluate(model, loader_a, device, "object_friendly_1_to_6")
+    res_a["checkpoint"] = str(args.checkpoint)
+    res_a["prompt_template"] = OBJECT_FRIENDLY_PROMPT_TEMPLATE
+    res_a["n_value"] = "1 to 6"
+    with open(output_dir / "condition_A_object_friendly_1_to_6.json", "w") as f:
+        json.dump(res_a, f, indent=2, ensure_ascii=False)
+
+    # ---- Condition B: object-friendly + "exactly 2" -------------------- #
+    print(f"\n{'='*70}")
+    print(f"  CONDITION B: object-friendly prompt, N='2' (exactly 2)")
+    print(f"{'='*70}")
+    collator_b = ObjectFriendlyCollator(model.processor, n_value="2")
+    loader_b = torch.utils.data.DataLoader(
+        test_ds, batch_size=1, shuffle=False, num_workers=0,
+        collate_fn=collator_b,
+    )
+    res_b = evaluate(model, loader_b, device, "object_friendly_exactly_2")
+    res_b["checkpoint"] = str(args.checkpoint)
+    res_b["prompt_template"] = OBJECT_FRIENDLY_PROMPT_TEMPLATE
+    res_b["n_value"] = "2"
+    with open(output_dir / "condition_B_object_friendly_exactly_2.json", "w") as f:
+        json.dump(res_b, f, indent=2, ensure_ascii=False)
 
     # ---- Summary -------------------------------------------------------- #
     summary = {
         "checkpoint": str(args.checkpoint),
-        "n_samples": len(res_1to6["per_sample"]),
-        "condition_A_1_to_6": {
-            "mean_iou": res_1to6["mean_iou"],
-            "mean_ari": res_1to6["mean_ari"],
-            "k_dist": res_1to6["k_dist"],
+        "n_samples": len(res_a["per_sample"]),
+        "prompt_change": "Replaced training-time 'NOT individual objects' directive with 'can be material surface OR prominent foreground element'",
+        "condition_A_object_friendly_1_to_6": {
+            "mean_iou": res_a["mean_iou"],
+            "mean_ari": res_a["mean_ari"],
+            "k_dist": res_a["k_dist"],
         },
-        "condition_B_exactly_2": {
-            "mean_iou": res_k2["mean_iou"],
-            "mean_ari": res_k2["mean_ari"],
-            "k_dist": res_k2["k_dist"],
+        "condition_B_object_friendly_exactly_2": {
+            "mean_iou": res_b["mean_iou"],
+            "mean_ari": res_b["mean_ari"],
+            "k_dist": res_b["k_dist"],
+        },
+        "baseline_from_previous_ablation_texture_only_ep7": {
+            "standard_1_to_6": {"mean_iou": 0.7394, "mean_ari": 0.5764},
+            "exactly_2":       {"mean_iou": 0.6943, "mean_ari": 0.5212},
         },
     }
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     print(f"\n{'='*70}")
-    print(f"  ABLATION: Prompt Count vs mIoU/mARI on RWTD")
+    print(f"  ABLATION: Object-Friendly Prompt on RWTD (ep7 / best.pt)")
     print(f"{'='*70}")
-    print(f"  {'Prompt':<20} {'mIoU':>8}  {'mARI':>8}  {'k_pred dist':<40}")
+    print(f"  {'Condition':<35} {'mIoU':>8}  {'mARI':>8}")
     print(f"  {'-'*70}")
-    kd1 = " ".join(f"{k}:{v}" for k, v in sorted(res_1to6["k_dist"].items()))
-    kd2 = " ".join(f"{k}:{v}" for k, v in sorted(res_k2["k_dist"].items()))
-    print(f"  {'1 to 6':<20} {res_1to6['mean_iou']:>8.4f}  "
-          f"{res_1to6['mean_ari']:>8.4f}  {kd1}")
-    print(f"  {'exactly 2':<20} {res_k2['mean_iou']:>8.4f}  "
-          f"{res_k2['mean_ari']:>8.4f}  {kd2}")
-    delta = res_k2["mean_iou"] - res_1to6["mean_iou"]
-    print(f"\n  Delta (mIoU): {delta:+.4f}")
+    print(f"  {'Prev ablation: texture-only 1to6':<35} "
+          f"{0.7394:>8.4f}  {0.5764:>8.4f}  (baseline)")
+    print(f"  {'Prev ablation: texture-only ex2':<35} "
+          f"{0.6943:>8.4f}  {0.5212:>8.4f}  (baseline)")
+    print(f"  {'NEW: object-friendly 1to6':<35} "
+          f"{res_a['mean_iou']:>8.4f}  {res_a['mean_ari']:>8.4f}")
+    print(f"  {'NEW: object-friendly exactly_2':<35} "
+          f"{res_b['mean_iou']:>8.4f}  {res_b['mean_ari']:>8.4f}")
     print(f"\n  Results saved to: {output_dir}")
 
 
