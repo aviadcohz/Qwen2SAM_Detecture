@@ -59,13 +59,13 @@
 
   "diagnostic_experiments": {
     "1_truncation_bug_discovery": {
-      "description": "max_new_tokens=150 in inference_forward caused Qwen to truncate descriptions mid-word on ADE20K_DeTexture (4+ textures). Regex fallback extracted corrupted hidden states from truncated lines.",
+      "description": "max_new_tokens=150 in inference_forward caused Qwen to truncate descriptions mid-word on ADE20K_Detecture (4+ textures). Regex fallback extracted corrupted hidden states from truncated lines.",
       "fix": "Increased max_new_tokens to 300, added truncation guard (skip last line if no <|im_end|>), fixed text_up_to to use line_idx instead of tex_count.",
       "impact_on_rwtd": "Negligible — RWTD descriptions fit in 150 tokens. k_pred distribution unchanged: {1:1, 2:46, 3:10, 4:1, 6:195}.",
       "impact_on_ade20k": "Negligible — Hungarian matching already rescued valid channels."
     },
     "2_control_group_ade20k_live": {
-      "description": "Ran inference_forward (live Qwen + regex extraction) on IN-DOMAIN ADE20K_DeTexture dataset to isolate domain gap vs engineering bug.",
+      "description": "Ran inference_forward (live Qwen + regex extraction) on IN-DOMAIN ADE20K_Detecture dataset to isolate domain gap vs engineering bug.",
       "results": {
         "ep5": {"miou": 0.7005, "k_pred": {"6": 212}},
         "ep10": {"miou": 0.7013, "k_pred": {"6": 212}},
@@ -106,7 +106,7 @@
     },
     {
       "finding": "In-domain performance is stable and excellent",
-      "evidence": "ADE20K_DeTexture live inference: 0.700→0.701→0.707 across epochs. No drift at all.",
+      "evidence": "ADE20K_Detecture live inference: 0.700→0.701→0.707 across epochs. No drift at all.",
       "impact": "Proves the architecture works. The issue is purely cross-domain."
     },
     {
@@ -154,7 +154,7 @@
         "comparison_vs_zs": "+0.025 over ZS baseline (0.7063) — FIRST TIME BEATEN"
       },
       "success_criterion": "If RWTD ep10 > 0.73 (no drift), the bottleneck is proven as the generalization fix.",
-      "files": ["models/qwen2sam_v4_slim.py", "configs/detexture_v4_slim.yaml", "training/train_v4_slim.py"]
+      "files": ["models/qwen2sam_v4_slim.py", "configs/detecture_v4_slim.yaml", "training/train_v4_slim.py"]
     },
     "v5_full": {
       "status": "ARCHITECTURE VALIDATED — Oracle mIoU=0.8098 on RWTD (epoch 7)",
@@ -167,7 +167,7 @@
         "No distillation loss — mask loss is the sole signal (pixels teach the [SEG] token)",
         "Identical extraction at train and test time (clean token lookup, no regex)"
       ],
-      "files": ["models/projector.py (V5)", "models/qwen2sam_detexture.py (V5)", "data/dataset.py (V5)", "models/losses.py (V5)", "training/train.py (V5)", "configs/detexture.yaml (V5)"]
+      "files": ["models/projector.py (V5)", "models/qwen2sam_detecture.py (V5)", "data/dataset.py (V5)", "models/losses.py (V5)", "training/train.py (V5)", "configs/detecture.yaml (V5)"]
     }
   },
 

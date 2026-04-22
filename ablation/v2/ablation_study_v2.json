@@ -3,11 +3,11 @@
   "run_id": "run_5_3front_attack",
   "date": "2026-04-09",
   "status": "completed (15 epochs so far, training continues)",
-  "motivation": "V1 (Run 4) achieved val mIoU=0.813 with teacher forcing but only 0.547 on inference (ADE20k_DeTexture) and 0.544 (RWTD at ep30). Qwen LoRA training degraded inference by -0.15 mIoU. Checkpoint comparison proved: epoch 5 (frozen Qwen) = 0.696, epoch 35 (trained Qwen) = 0.543. The Qwen LoRA overfits to ADE20K scene-level patterns.",
+  "motivation": "V1 (Run 4) achieved val mIoU=0.813 with teacher forcing but only 0.547 on inference (ADE20k_Detecture) and 0.544 (RWTD at ep30). Qwen LoRA training degraded inference by -0.15 mIoU. Checkpoint comparison proved: epoch 5 (frozen Qwen) = 0.696, epoch 35 (trained Qwen) = 0.543. The Qwen LoRA overfits to ADE20K scene-level patterns.",
   "hypothesis": "Three-pronged attack: (1) Crop augmentation to simulate RWTD-style close-ups, (2) Cycle consistency to force projector to retain semantic info, (3) Constrained Qwen LoRA (r=4) to prevent overfitting.",
   "architecture_changes": {
     "front_1_crop_augmentation": {
-      "description": "Dynamic Macro-to-Micro crop in DeTextureDataset.__getitem__. 35% probability random crop (300-600px), requires >=2 surviving textures, remaps indices/descriptions/embeddings contiguously.",
+      "description": "Dynamic Macro-to-Micro crop in DetectureDataset.__getitem__. 35% probability random crop (300-600px), requires >=2 surviving textures, remaps indices/descriptions/embeddings contiguously.",
       "file": "data/dataset.py",
       "effect": "Prevents Qwen from expecting only full-scene images. Forces model to handle zoom-in texture crops like RWTD."
     },
@@ -15,14 +15,14 @@
       "description": "InverseProjector (256\u21924096) reconstructs tex_embeds from projected queries. cycle_loss = MSE(recon, gt.detach()). Gradient firewall: only updates InverseProjector + Projector, not Qwen/SAM.",
       "files": [
         "models/projector.py (InverseProjector)",
-        "models/qwen2sam_detexture.py",
+        "models/qwen2sam_detecture.py",
         "models/losses.py"
       ],
       "effect": "Forces 256-dim projection to retain semantic DNA. Active only in Phase 2 (cycle_weight=0.0 in Phase 1, 0.05 in Phase 2)."
     },
     "front_3_constrained_qwen": {
       "description": "Reduced Qwen LoRA from r=16,alpha=32 to r=4,alpha=8. 4x less capacity to prevent domain overfitting.",
-      "file": "configs/detexture.yaml",
+      "file": "configs/detecture.yaml",
       "effect": "Qwen can fine-tune gently but cannot memorize ADE20K-specific patterns."
     }
   },
@@ -325,8 +325,8 @@
   ],
   "experiments_conducted": [
     {
-      "name": "Checkpoint comparison (ADE20k_DeTexture)",
-      "description": "Tested epoch 5, 15, 35 checkpoints on 212 ADE20k_DeTexture samples",
+      "name": "Checkpoint comparison (ADE20k_Detecture)",
+      "description": "Tested epoch 5, 15, 35 checkpoints on 212 ADE20k_Detecture samples",
       "result": "Epoch 5 (P1): 0.696, Epoch 15 (P1): 0.691, Epoch 35 (P2): 0.543. Confirmed Qwen LoRA degradation.",
       "file": "ablation/comparison_k_pred/checkpoint_comparison.json"
     },
@@ -379,7 +379,7 @@
     "status": "IMPLEMENTED in run_sam3_semantic, ready for next training run",
     "expected_impact": "Slot 2+ should now receive non-zero pixel allocation. Multi-texture segmentation should work for the first time.",
     "verification": "Re-run eval_positional_bias.py to confirm slot 2 allocation > 0%",
-    "file": "models/qwen2sam_detexture.py"
+    "file": "models/qwen2sam_detecture.py"
   },
   "baselines": {
     "generic_zero_shot": {

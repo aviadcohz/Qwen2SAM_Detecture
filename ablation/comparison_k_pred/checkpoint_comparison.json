@@ -1,6 +1,6 @@
 {
-  "experiment": "Checkpoint comparison on ADE20k_DeTexture (inference)",
-  "dataset": "ADE20k_DeTexture (212 samples, 92% overlap with training images)",
+  "experiment": "Checkpoint comparison on ADE20k_Detecture (inference)",
+  "dataset": "ADE20k_Detecture (212 samples, 92% overlap with training images)",
   "purpose": "Confirm that Qwen LoRA training degrades inference-time segmentation quality",
 
   "results": {

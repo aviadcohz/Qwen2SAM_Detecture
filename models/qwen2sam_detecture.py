@@ -1,5 +1,5 @@
 """
-Qwen2SAM-DeTexture V5: End-to-End VLM-Guided Multi-Texture Segmentation.
+Qwen2SAM-Detecture V5: End-to-End VLM-Guided Multi-Texture Segmentation.
 
 Architecture (V5 — [SEG] Token + Bottleneck Projector):
   Qwen3-VL-8B (LoRA r=8) → generates "TEXTURE_N: <desc> <|seg|>" lines
@@ -133,7 +133,7 @@ def load_sam3(model_cfg: dict, device):
 #  Main Model                                                             #
 # ===================================================================== #
 
-class Qwen2SAMDeTexture(nn.Module):
+class Qwen2SAMDetecture(nn.Module):
     """
     V5 End-to-End multi-texture segmentation model.
 
@@ -163,6 +163,18 @@ class Qwen2SAMDeTexture(nn.Module):
             self.qwen.enable_input_require_grads()
             self.qwen.gradient_checkpointing_enable()
         self.qwen.to(self.device)
+
+        # ---- V7 fix: trainable SEG row in embed + lm_head ---------------- #
+        # The <|seg|> token is appended AFTER Qwen's pretraining, so its
+        # input-embedding and lm_head rows are randomly initialised. LoRA on
+        # q/v never reaches those rows, so SEG can never win argmax during
+        # generation — live inference silently emits <|tool_call|> / <|im_end|>
+        # instead. We warm-start the SEG row from a well-trained reference
+        # token (<|im_end|>) and install a per-row gradient mask so ONLY the
+        # SEG row receives updates. The rest of the vocabulary stays frozen.
+        self._seg_row_params = self._enable_seg_row_training(
+            ref_token=model_cfg.get("seg_warmstart_token", "<|im_end|>"),
+        )
 
         # ---- SAM3 (100% frozen in V7 — no LoRA) ------------------------ #
         self.sam3 = load_sam3(model_cfg, self.device)
@@ -200,6 +212,72 @@ class Qwen2SAMDeTexture(nn.Module):
     def _freeze_sam3(self):
         for param in self.sam3.parameters():
             param.requires_grad = False
+
+    def _enable_seg_row_training(self, ref_token: str = "<|im_end|>") -> list:
+        """Unlock the <|seg|> token's input embedding and lm_head rows for
+        training, with a per-row gradient mask so only those rows update.
+
+        Why this is needed:
+          The <|seg|> token is added AFTER base Qwen training via
+          resize_token_embeddings, which appends randomly-initialised rows to
+          BOTH `embed_tokens.weight` and `lm_head.weight`. Qwen LoRA (on
+          q_proj / v_proj) never touches those rows, so `lm_head.weight[SEG]`
+          stays random forever. Result: during generation, SEG's logit is a
+          random projection of the hidden state and never wins argmax —
+          Qwen picks `<|tool_call|>` / `<|im_end|>` instead, so live inference
+          returns 0 mIoU while teacher-forced Oracle works fine.
+
+        The fix:
+          (1) Warm-start: copy the reference token's (default `<|im_end|>`)
+              row into the SEG row for both embed and lm_head — gives SEG
+              a sensible statistical starting point instead of random noise.
+          (2) Unfreeze the full weight tensors and register a per-row
+              gradient mask that zeros out all rows except SEG. The
+              optimizer thus updates only the SEG row; the rest of the
+              vocabulary stays exactly at its pretrained values.
+
+        Returns the list of two weight tensors so the outer curriculum can
+        toggle their requires_grad in sync with Qwen LoRA (Stage 1 off,
+        Stage 2 on). Hooks are persistent — they fire whenever a gradient
+        is produced on these tensors.
+        """
+        tok = self.processor.tokenizer
+        ref_id = tok.convert_tokens_to_ids(ref_token)
+        seg_id = self.seg_token_id
+        if ref_id is None or ref_id == tok.unk_token_id:
+            raise ValueError(f"reference token {ref_token!r} not in vocab — "
+                             f"pick a real special token for warm-start")
+
+        embed = self.qwen.get_input_embeddings()
+        lm_head = self.qwen.get_output_embeddings()
+
+        # ---- (1) Warm-start SEG row <- reference row --------------------- #
+        with torch.no_grad():
+            embed.weight[seg_id].copy_(embed.weight[ref_id])
+            lm_head.weight[seg_id].copy_(lm_head.weight[ref_id])
+
+        # ---- (2) Unfreeze + per-row gradient mask ------------------------ #
+        def _make_mask_hook(row_id: int):
+            """Returns a grad-hook that zeros every row except `row_id`."""
+            def _hook(grad):
+                # Build a {0,1} mask with a 1 only on row_id, same dtype/device.
+                mask = torch.zeros_like(grad)
+                mask[row_id] = 1.0
+                return grad * mask
+            return _hook
+
+        trainable = []
+        for tensor_name, w in (("embed_tokens", embed.weight),
+                                ("lm_head",       lm_head.weight)):
+            w.requires_grad_(True)
+            w.register_hook(_make_mask_hook(seg_id))
+            trainable.append(w)
+
+        ref_name = ref_token
+        print(f"  SEG row training enabled: seg_id={seg_id}, "
+              f"warm-started from {ref_name!r} (id={ref_id}). "
+              f"Gradient mask restricts updates to row {seg_id} only.")
+        return trainable
 
     # ------------------------------------------------------------------ #
     #  V5 Block-Diagonal Attention Mask (Anti-Context-Leakage)             #
@@ -702,9 +780,14 @@ class Qwen2SAMDeTexture(nn.Module):
                        Frozen in Stage 1; unfrozen at Stage 2.
         - Bridge:     full base LR (1e-4). Decayed 10× at Stage 2 entry.
         - Mask head + dustbin: full base LR.
+        - SEG rows (embed + lm_head): base LR. Frozen in Stage 1; unfrozen
+          at Stage 2. Full tensors are in the group but a gradient mask
+          restricts effective updates to the SEG row only (see
+          `_enable_seg_row_training`).
         - SAM3:       100% frozen permanently — no LoRA group.
         """
         qwen_lr_scale = self.cfg["model"].get("qwen_lr_scale", 0.01)
+        seg_row_lr_scale = self.cfg["model"].get("seg_row_lr_scale", 1.0)
 
         qwen_lora_params = [
             p for n, p in self.qwen.named_parameters()
@@ -714,14 +797,22 @@ class Qwen2SAMDeTexture(nn.Module):
         bridge_params = list(self.bridge.parameters())
         mask_head_params = list(self.mask_head.parameters())
         dustbin_params = [self.dustbin_embed]
+        seg_row_params = list(getattr(self, "_seg_row_params", []))
 
-        return [
+        groups = [
             {"params": qwen_lora_params,
              "lr": base_lr * qwen_lr_scale, "name": "qwen_lora"},
             {"params": bridge_params, "lr": base_lr, "name": "bridge"},
             {"params": mask_head_params, "lr": base_lr, "name": "mask_head"},
             {"params": dustbin_params, "lr": base_lr, "name": "dustbin"},
         ]
+        if seg_row_params:
+            groups.append({
+                "params": seg_row_params,
+                "lr": base_lr * seg_row_lr_scale,
+                "name": "seg_rows",
+            })
+        return groups
 
     def num_trainable_params(self) -> dict:
         qwen_lora_n = sum(
@@ -731,11 +822,27 @@ class Qwen2SAMDeTexture(nn.Module):
         bridge_n = sum(p.numel() for p in self.bridge.parameters())
         mask_head_n = sum(p.numel() for p in self.mask_head.parameters())
         dustbin_n = self.dustbin_embed.numel()
-        total = qwen_lora_n + bridge_n + mask_head_n + dustbin_n
+
+        # SEG-row effective count (one row of embed + one row of lm_head).
+        # The tensors themselves are full vocab×hidden, but the gradient
+        # mask zeros all rows except SEG — so EFFECTIVELY only 2 × hidden
+        # parameters learn. We report the effective count for clarity.
+        if getattr(self, "_seg_row_params", None):
+            hidden = self._seg_row_params[0].shape[-1]
+            seg_rows_effective = 2 * hidden
+            seg_rows_raw = sum(p.numel() for p in self._seg_row_params)
+        else:
+            seg_rows_effective = 0
+            seg_rows_raw = 0
+
+        total = (qwen_lora_n + bridge_n + mask_head_n + dustbin_n
+                 + seg_rows_effective)
         return {
             "qwen_lora": qwen_lora_n,
             "bridge": bridge_n,
             "mask_head": mask_head_n,
             "dustbin": dustbin_n,
+            "seg_rows_effective": seg_rows_effective,
+            "seg_rows_raw_tensor_size": seg_rows_raw,
             "total_trainable": total,
         }

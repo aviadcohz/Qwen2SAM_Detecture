@@ -24,9 +24,9 @@ import torch.nn.functional as F
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from models.qwen2sam_detexture import Qwen2SAMDeTexture, MAX_TEXTURES
+from models.qwen2sam_detecture import Qwen2SAMDetecture, MAX_TEXTURES
 from data.dataset import (
-    DeTextureDataset, DeTextureCollator,
+    DetectureDataset, DetectureCollator,
     SYSTEM_PROMPT, USER_PROMPT_TEMPLATE,
 )
 from training.utils import load_config, load_checkpoint
@@ -38,7 +38,7 @@ from scipy.optimize import linear_sum_assignment
 #  Custom collator with "exactly 2" prompt                                #
 # ===================================================================== #
 
-class ExactKCollator(DeTextureCollator):
+class ExactKCollator(DetectureCollator):
     """Collator that uses 'exactly K' in the user prompt instead of '1 to 6'."""
 
     def __init__(self, processor, k: int = 2):
@@ -169,7 +169,7 @@ def evaluate(model, loader, device, label):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/detexture.yaml")
+    parser.add_argument("--config", default="configs/detecture.yaml")
     parser.add_argument("--checkpoint", default="checkpoints/epoch_5.pt")
     parser.add_argument("--test-metadata",
                         default="/home/aviad/datasets/RWTD/metadata.json")
@@ -187,12 +187,12 @@ def main():
     device = torch.device("cuda")
 
     print("Building model...")
-    model = Qwen2SAMDeTexture(cfg, device="cuda")
+    model = Qwen2SAMDetecture(cfg, device="cuda")
     print(f"Loading checkpoint: {args.checkpoint}")
     load_checkpoint(model, None, args.checkpoint, device="cuda")
     model.eval()
 
-    test_ds = DeTextureDataset(
+    test_ds = DetectureDataset(
         args.test_metadata,
         image_size=cfg["data"].get("image_size", 1008),
         augment=False,
@@ -204,7 +204,7 @@ def main():
     print(f"\n{'='*70}")
     print(f"  CONDITION A: prompt='1 to 6' (current default)")
     print(f"{'='*70}")
-    collator_1to6 = DeTextureCollator(model.processor, inference=True)
+    collator_1to6 = DetectureCollator(model.processor, inference=True)
     loader_1to6 = torch.utils.data.DataLoader(
         test_ds, batch_size=1, shuffle=False, num_workers=0,
         collate_fn=collator_1to6,

@@ -1,5 +1,5 @@
 """
-V5 Loss functions for Qwen2SAM-DeTexture.
+V5 Loss functions for Qwen2SAM-Detecture.
 
 L_total = λ_mask × (CE + Dice) + λ_lm × LM([SEG] only) + λ_orth × Orthogonal
 
@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.qwen2sam_detexture import NUM_QUERY_SLOTS
+from models.qwen2sam_detecture import NUM_QUERY_SLOTS
 
 
 # ===================================================================== #

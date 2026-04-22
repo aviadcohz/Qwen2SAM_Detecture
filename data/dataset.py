@@ -1,5 +1,5 @@
 """
-Multi-texture dataset and collator for Qwen2SAM-DeTexture.
+Multi-texture dataset and collator for Qwen2SAM-Detecture.
 
 Each sample has K (1-5) textures with:
   - Image (PIL)
@@ -85,7 +85,7 @@ def build_assistant_text(descriptions: list[str]) -> str:
         "TEXTURE_1: Texture of rough mossy stone in the foreground <|seg|>
          TEXTURE_2: Texture of smooth water in the center <|seg|>"
     """
-    from models.qwen2sam_detexture import SEG_TOKEN
+    from models.qwen2sam_detecture import SEG_TOKEN
     lines = []
     for i, desc in enumerate(descriptions):
         lines.append(f"TEXTURE_{i+1}: {desc} {SEG_TOKEN}")
@@ -120,23 +120,40 @@ def find_assistant_start(ids: torch.Tensor, tokenizer, im_start_id: int) -> int:
 
 def create_labels(input_ids: torch.Tensor, attention_mask: torch.Tensor,
                   tokenizer) -> tuple:
-    """V7 Exponential LM Loss Weighting.
+    """V7 Exponential LM Loss Weighting with "Shifted Zero" gradient decoupling.
 
-    Weight(d) = 1 - exp(-α * d), α = 2.0
+    Base curve (same as before):
+      Weight(d) = 1 - exp(-α * d), α = 2.0
       where d = token-wise distance to the nearest assistant-region
-      <|seg|> token. Weight at d=0 (the [SEG] token itself) is forced
-      to 0.0 — Qwen has total freedom to warp this token for geometry.
+      <|seg|> token. A soft "freedom basin" around each SEG.
 
-    Example weights:
-      d=0 → 0.000 (SEG token, free)
-      d=1 → 0.865
-      d=2 → 0.982
-      d=3 → 0.998
-      d≥4 → ≈1.0 (full LM supervision)
+    Two overrides applied AFTER the base curve — this is the gradient-routing
+    fix (V6/prior V7 bug: Qwen was given weight=0 at the SEG target position
+    itself, so autoregressive loss never forced emission of <|seg|>):
 
-    This is a "cliff": the LM pressure spikes sharply outside the
-    [SEG] itself, preventing V5's catastrophic language forgetting
-    without the gentle-tug-of-war we saw with V6's cosine schedule.
+      (1) FORCE EMISSION.  w[seg_positions] = 1.0
+          In causal LM with shift-1 loss, shift_weights[i] = lm_weights[i+1].
+          So the weight that drives the model to PREDICT <|seg|> at position
+          seg_pos (from the hidden state at seg_pos-1) is lm_weights[seg_pos].
+          Setting this to 1.0 gives Qwen full gradient pressure to emit the
+          special token at exactly the right place.
+
+      (2) GEOMETRIC FREEDOM (SHIFTED ZERO).  w[seg_positions + 1] = 0.0
+          The HIDDEN STATE *of* the <|seg|> token is used by the Bridge to
+          drive SAM (via the mask/DICE loss). In the LM path, that same
+          hidden state predicts the token at position seg_pos + 1, with
+          weight shift_weights[seg_pos] = lm_weights[seg_pos + 1].
+          Zeroing lm_weights[seg_pos + 1] removes any LM pressure on SEG's
+          hidden state, leaving it free to be shaped purely by the
+          segmentation gradient. Bounds-checked against L.
+
+    Concrete weights after overrides (assume d>=3 for "far" tokens):
+      position         lm_weights[pos]     controls
+      ---------------  -----------------   --------------------------
+      seg_pos - 1      ~0.865 (d=1)        pressure ON Qwen to PREDICT seg_pos-1
+      seg_pos          1.000 (override 1)  pressure to EMIT <|seg|> at seg_pos
+      seg_pos + 1      0.000 (override 2)  ZERO pressure — frees SEG's hidden state
+      seg_pos + 2      ~0.982 (d=1)        normal LM pressure resumes
 
     Note on V7 prompt template: the user prompt contains literal
     "<|seg|>" text which tokenises to the special SEG token. We filter
@@ -146,9 +163,9 @@ def create_labels(input_ids: torch.Tensor, attention_mask: torch.Tensor,
     Returns:
         labels:     (B, L) — token IDs for assistant text, -100 for
                     system/user/prefix/padding.
-        lm_weights: (B, L) — per-token exponential-cliff LM weight.
+        lm_weights: (B, L) — per-token exponential + Shifted-Zero weights.
     """
-    from models.qwen2sam_detexture import SEG_TOKEN
+    from models.qwen2sam_detecture import SEG_TOKEN
 
     ALPHA = 2.0
     seg_token_id = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
@@ -174,14 +191,25 @@ def create_labels(input_ids: torch.Tensor, attention_mask: torch.Tensor,
         labels[b, :asst_start] = -100
         labels[b, attention_mask[b] == 0] = -100
 
-        # Vectorised per-position distance-to-nearest-SEG within assistant.
+        # ---- Base exponential curve (soft freedom basin) -------------- #
         positions = torch.arange(L, dtype=torch.long)
         dists = (positions.unsqueeze(1) - seg_positions.cpu().unsqueeze(0)).abs()
-        min_d = dists.min(dim=1).values.float()  # (L,)
-        w = 1.0 - torch.exp(-ALPHA * min_d)       # (L,)
-        w[seg_positions] = 0.0                    # SEG token: free
+        min_d = dists.min(dim=1).values.float()   # (L,)
+        w = 1.0 - torch.exp(-ALPHA * min_d)        # (L,)
 
-        # Zero weights outside assistant and on padding / already-masked.
+        # ---- Shifted-Zero override ------------------------------------ #
+        # (1) FORCE EMISSION: weight at SEG's own position = 1.0 so Qwen
+        #     learns to predict <|seg|> at exactly this position.
+        w[seg_positions] = 1.0
+
+        # (2) GEOMETRIC FREEDOM: weight at position (SEG + 1) = 0.0 so
+        #     the hidden state AT the SEG position is never pressured by
+        #     "what comes next" LM supervision. Bounds-check against L.
+        post_seg = seg_positions + 1
+        post_seg = post_seg[post_seg < L]           # drop any that fall off the end
+        w[post_seg] = 0.0
+
+        # ---- Standard prefix / padding masking ------------------------ #
         w[:asst_start] = 0.0
         w[attention_mask[b] == 0] = 0.0
         lm_weights[b] = w
@@ -193,7 +221,7 @@ def create_labels(input_ids: torch.Tensor, attention_mask: torch.Tensor,
 #  Dataset                                                                #
 # ===================================================================== #
 
-class DeTextureDataset(Dataset):
+class DetectureDataset(Dataset):
     """
     Multi-texture dataset.
 
@@ -260,7 +288,7 @@ class DeTextureDataset(Dataset):
         # Remap surviving indices to contiguous 1..N
         new_mask = np.zeros_like(cropped_mask)
         new_descriptions = []
-        from models.qwen2sam_detexture import MAX_TEXTURES
+        from models.qwen2sam_detecture import MAX_TEXTURES
         new_qwen_gt = torch.zeros(MAX_TEXTURES, 4096)
 
         for new_idx, old_idx in enumerate(surviving_ids):
@@ -292,7 +320,7 @@ class DeTextureDataset(Dataset):
                               interpolation=cv2.INTER_LINEAR)
 
         # Load per-texture masks and build index mask (cap at MAX_TEXTURES)
-        from models.qwen2sam_detexture import MAX_TEXTURES
+        from models.qwen2sam_detecture import MAX_TEXTURES
         textures = meta["textures"][:MAX_TEXTURES]
         k_gt = len(textures)
         descriptions = []
@@ -308,7 +336,7 @@ class DeTextureDataset(Dataset):
                 index_mask[mask > 127] = i + 1
 
         # Load pre-computed Qwen GT embeddings if available
-        from models.qwen2sam_detexture import MAX_TEXTURES
+        from models.qwen2sam_detecture import MAX_TEXTURES
         qwen_gt = torch.zeros(MAX_TEXTURES, 4096)
         if self.gt_embeds is not None:
             key = meta["image_path"]
@@ -347,9 +375,9 @@ class DeTextureDataset(Dataset):
 #  Collator                                                               #
 # ===================================================================== #
 
-class DeTextureCollator:
+class DetectureCollator:
     """
-    Collate function for Qwen2SAM-DeTexture DataLoader.
+    Collate function for Qwen2SAM-Detecture DataLoader.
 
     Builds Qwen chat messages, tokenizes, creates LM labels,
     and stacks SAM3 inputs + GT masks. CPU-only — no GPU operations.

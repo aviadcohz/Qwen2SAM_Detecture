@@ -199,7 +199,7 @@
   },
 
   "next_experiments": {
-    "resume_run": "python -m training.train --config configs/detexture.yaml --resume checkpoints/best.pt",
+    "resume_run": "python -m training.train --config configs/detecture.yaml --resume checkpoints/best.pt",
     "expected_trajectory": "Epochs 8-10 complete Stage 1 (still projector-only). Epoch 11 fires Stage 2 transition (Qwen unfreeze + first decay). Epoch 15 fires Stage 3 transition (SAM unfreeze + second decay). Test eval at ep10 and ep15 gives uninflated RWTD checkpoints.",
     "hypotheses_to_test": [
       {

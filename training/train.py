@@ -1,5 +1,5 @@
 """
-V5 Training loop for Qwen2SAM-DeTexture.
+V5 Training loop for Qwen2SAM-Detecture.
 
 Architecture: [SEG] Token + Bottleneck Projector + Loss Masking.
 
@@ -17,8 +17,8 @@ No distillation loss, no InverseProjector, no pre-computed GT embeddings.
 Live Qwen forward in EVERY epoch.
 
 Usage:
-    cd /home/aviad/Qwen2SAM_DeTexture
-    python -m training.train --config configs/detexture.yaml
+    cd /home/aviad/Qwen2SAM_Detecture
+    python -m training.train --config configs/detecture.yaml
 """
 
 import argparse
@@ -34,9 +34,9 @@ from torch.utils.data import DataLoader
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from models.qwen2sam_detexture import Qwen2SAMDeTexture
+from models.qwen2sam_detecture import Qwen2SAMDetecture
 from models.losses import combined_loss
-from data.dataset import DeTextureDataset, DeTextureCollator
+from data.dataset import DetectureDataset, DetectureCollator
 from training.utils import (
     load_config, set_seed, AverageMeter, WarmupCosineScheduler,
     get_lr, save_checkpoint, load_checkpoint,
@@ -52,6 +52,18 @@ def _set_qwen_lora_grad(model, requires_grad: bool):
     for n, p in model.qwen.named_parameters():
         if "lora" in n.lower():
             p.requires_grad = requires_grad
+
+
+def _set_seg_row_grad(model, requires_grad: bool):
+    """Toggle training of the <|seg|> token's embed + lm_head rows (the
+    per-row gradient mask installed in qwen2sam_detecture restricts actual
+    updates to the SEG row, but the full tensor must be requires_grad=True
+    for gradients to be computed at all)."""
+    rows = getattr(model, "_seg_row_params", None)
+    if not rows:
+        return
+    for p in rows:
+        p.requires_grad_(requires_grad)
 
 
 def decay_bridge_lr(optimizer, scheduler, factor: float) -> tuple:
@@ -91,9 +103,11 @@ def apply_curriculum(model, epoch, cfg):
 
     if epoch < warmup_epochs:
         _set_qwen_lora_grad(model, False)
+        _set_seg_row_grad(model, False)
         return 1, {}
     else:
         _set_qwen_lora_grad(model, True)
+        _set_seg_row_grad(model, True)
         return 2, {}
 
 
@@ -279,8 +293,22 @@ def validate(model, dataloader, cfg, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/detexture.yaml")
+    parser.add_argument("--config", type=str, default="configs/detecture.yaml")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--resume-lr-scale", type=float, default=None,
+        help="Micro-Warmup Restart on resume: rebuild the LR scheduler with "
+             "each param group's peak set to (original base LR * scale), "
+             "preserving per-group ratios (Bridge vs Qwen-LoRA vs SEG rows). "
+             "A short warmup ramps to that scaled peak, then cosine decays "
+             "over the REMAINING epochs (num_epochs - start_epoch). "
+             "Typical value: 0.15.",
+    )
+    parser.add_argument(
+        "--resume-warmup-epochs", type=int, default=2,
+        help="Warmup length (epochs) for the Micro-Warmup Restart. Only "
+             "effective when --resume-lr-scale is set.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -324,8 +352,8 @@ def main():
         )
 
     # ---- Model --------------------------------------------------------- #
-    print("Building Qwen2SAM-DeTexture V7 model...")
-    model = Qwen2SAMDeTexture(cfg, device=str(device))
+    print("Building Qwen2SAM-Detecture V7 model...")
+    model = Qwen2SAMDetecture(cfg, device=str(device))
     params = model.num_trainable_params()
     print(f"Trainable parameters:")
     for k, v in params.items():
@@ -334,20 +362,20 @@ def main():
     # ---- Data ---------------------------------------------------------- #
     data_cfg = cfg["data"]
 
-    train_ds = DeTextureDataset(
+    train_ds = DetectureDataset(
         data_cfg["train_metadata"],
         image_size=data_cfg.get("image_size", 1008),
         augment=data_cfg.get("augment", True),
         qwen_gt_embeds_path=data_cfg.get("qwen_gt_embeds_path"),
     )
-    val_ds = DeTextureDataset(
+    val_ds = DetectureDataset(
         data_cfg["val_metadata"],
         image_size=data_cfg.get("image_size", 1008),
         augment=False,
         qwen_gt_embeds_path=data_cfg.get("qwen_gt_embeds_path"),
     )
 
-    collator = DeTextureCollator(model.processor)
+    collator = DetectureCollator(model.processor)
 
     train_loader = DataLoader(
         train_ds,
@@ -389,11 +417,17 @@ def main():
         min_lr=train_cfg.get("min_lr", 1e-6),
         steps_per_epoch=max(steps_per_epoch, 1),
     )
-    scaler = torch.amp.GradScaler("cuda")
+    # GradScaler is a fp16 feature — bf16 doesn't need loss scaling and
+    # `_unscale_grads_` isn't implemented for bf16 gradients, so keep the
+    # scaler disabled. All scaler.* calls in train_one_epoch become no-ops;
+    # scaler.scale(loss) returns loss unchanged, scaler.step() just calls
+    # optimizer.step(), scaler.update() / scaler.unscale_() are no-ops.
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
 
     # ---- Resume -------------------------------------------------------- #
     start_epoch = 0
     best_iou = 0.0
+    stage_initialized = {1: False, 2: False}
 
     resume_path = args.resume
     if resume_path == "auto":
@@ -411,13 +445,62 @@ def main():
         start_epoch = load_checkpoint(model, optimizer, resume_path, device=str(device))
         start_epoch += 1
         best_iou = state.get("val_iou", 0.0)
-        total_steps_done = start_epoch * max(steps_per_epoch, 1)
-        for _ in range(total_steps_done):
-            scheduler.step()
+
+        if args.resume_lr_scale is not None:
+            # Micro-Warmup Restart: rebuild the scheduler around a scaled peak
+            # LR over the REMAINING epochs. Preserves per-group ratios, keeps
+            # optimizer moments, and avoids shocking weights that are already
+            # in a good basin.
+            scale = float(args.resume_lr_scale)
+            remaining = train_cfg["num_epochs"] - start_epoch
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"--resume-lr-scale requires remaining epochs > 0 "
+                    f"(start_epoch={start_epoch}, num_epochs={train_cfg['num_epochs']}). "
+                    f"Bump num_epochs in the config."
+                )
+
+            # Recover each group's original peak LR by re-invoking
+            # get_parameter_groups with the config base LR. Match by name
+            # (with positional fallback for any unnamed groups).
+            original_groups = model.get_parameter_groups(train_cfg["learning_rate"])
+            name_to_lr = {g["name"]: g["lr"] for g in original_groups if "name" in g}
+            for i, pg in enumerate(optimizer.param_groups):
+                name = pg.get("name")
+                orig_lr = name_to_lr.get(name)
+                if orig_lr is None and i < len(original_groups):
+                    orig_lr = original_groups[i]["lr"]
+                if orig_lr is None:
+                    orig_lr = pg["lr"]
+                pg["lr"] = orig_lr * scale
+
+            scheduler = WarmupCosineScheduler(
+                optimizer,
+                warmup_epochs=args.resume_warmup_epochs,
+                total_epochs=remaining,
+                min_lr=train_cfg.get("min_lr", 1e-6),
+                steps_per_epoch=max(steps_per_epoch, 1),
+            )
+            # The scale already encodes the Stage-2 Bridge decay, so suppress
+            # decay_bridge_lr() firing again at the first post-resume epoch.
+            stage_initialized[2] = True
+
+            print(f"  Micro-Warmup Restart engaged:")
+            print(f"    LR scale          : {scale}")
+            print(f"    Warmup            : {args.resume_warmup_epochs} epochs")
+            print(f"    Cosine decay over : {remaining} remaining epochs")
+            print(f"    Per-group peak LRs (scaled):")
+            for pg in optimizer.param_groups:
+                nm = pg.get("name", "unnamed")
+                print(f"      {nm:<12s} peak = {pg['lr']:.2e}")
+        else:
+            total_steps_done = start_epoch * max(steps_per_epoch, 1)
+            for _ in range(total_steps_done):
+                scheduler.step()
+
         print(f"  Resumed at epoch {start_epoch + 1}, best_iou={best_iou:.4f}")
 
     # ---- Training loop ------------------------------------------------- #
-    stage_initialized = {1: False, 2: False}
 
     warmup_ep = curriculum.get("projector_warmup_epochs", 12)
     bridge_decay_s2 = curriculum.get("projector_lr_decay_at_stage2", 0.1)

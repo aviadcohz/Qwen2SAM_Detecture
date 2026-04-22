@@ -19,7 +19,7 @@
     "the_v6_final_postmortem": {
       "finding": "V6-Extended training completed 20 epochs, monotonic on val (0.62 -> 0.68) but regressed on RWTD (0.738 at ep10 -> 0.692 at ep15 live-inference-1-to-6)",
       "mechanism": "Stage 3 SAM LoRA adaptation concentrated representations onto the training-prompt distribution. Under structured-prompt ablations, ep18 dropped 0.111 mIoU below ep10. Classic domain memorisation.",
-      "implication": "Val mIoU on ADE20K_DeTexture is a misleading proxy once Stage 3 fires. Honest OOD metric (exactly-2 live on RWTD) peaks at Stage 1 end."
+      "implication": "Val mIoU on ADE20K_Detecture is a misleading proxy once Stage 3 fires. Honest OOD metric (exactly-2 live on RWTD) peaks at Stage 1 end."
     },
     "the_bottleneck_smoking_gun": {
       "finding": "V6 best-honest live RWTD mIoU = 0.694 (ep7, training prompt exactly-2). ZS SAM with object-aware prompt = 0.928. Delta = 0.234.",
@@ -72,7 +72,7 @@
   "lessons_learned": [
     "Square bottlenecks compress Qwen's rich vocabulary before SAM can see it. Use the target model's native width instead and borrow its pretrained projection for the final step. Cross-model alignment is a shape problem, not a learning problem, when both endpoints are pretrained.",
     "LM loss schedules that don't isolate the grounding token produce a constant tug-of-war between DICE and LM. An exponential cliff with weight(d=0)=0 is mathematically clean: the SEG is geometrically free, everything else is linguistically anchored.",
-    "The 'verify stability in-domain, then stress-test OOD' strategy from V4 paid off again. V6-Extended looked fine on val but regressed on RWTD. ADE20K_DeTexture + RWTD stays the right dual-evaluation regime.",
+    "The 'verify stability in-domain, then stress-test OOD' strategy from V4 paid off again. V6-Extended looked fine on val but regressed on RWTD. ADE20K_Detecture + RWTD stays the right dual-evaluation regime.",
     "Freezing is a first-class design choice. V5 and V6b all tried to cleverly unfreeze SAM; all backfired on OOD. 'Freeze forever' removes an entire class of failure modes.",
     "Prompt format and training target must align. V6 trained with <|seg|> in labels but not in the user-visible prompt template. V7 makes this explicit. The downstream cost (prompt-side SEG filtering) is small and localised.",
     "The true baseline is not 'zero-shot SAM with the generic texture prompt' (0.706) but 'zero-shot SAM with a well-crafted object-aware prompt' (0.928). Always verify the upper bound before deciding where to train."
@@ -93,7 +93,7 @@
     },
     "proof_3_param_counts_match_blueprint": {
       "claim": "V7 trainable parameter counts match the intended design",
-      "experiment": "Instantiate Qwen2SAMDeTexture(cfg) with V7 config and call num_trainable_params()",
+      "experiment": "Instantiate Qwen2SAMDetecture(cfg) with V7 config and call num_trainable_params()",
       "data": {"qwen_lora": 3833856, "bridge": 4197376, "mask_head": 197376, "dustbin": 4096, "total": 8232704},
       "conclusion": "Bridge is 4.20M (dominant), total 8.23M trainable, matches expected +1.97M over V6."
     }
@@ -108,7 +108,7 @@
   },
 
   "next_steps": {
-    "immediate": "Launch V7 training from scratch. python -m training.train --config configs/detexture.yaml.",
+    "immediate": "Launch V7 training from scratch. python -m training.train --config configs/detecture.yaml.",
     "during_training_canaries": [
       "train_mask_dice drops below 0.35 by end of Stage 1 (H2 success)",
       "Epoch 8 RWTD live mIoU >= Epoch 4 (H4 success: no drift)",

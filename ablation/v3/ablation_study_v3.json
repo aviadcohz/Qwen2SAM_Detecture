@@ -8,7 +8,7 @@
   "architecture_changes": {
     "batch_multiplexing": {
       "description": "Rewrote run_sam3_semantic to flatten (B, 7, 256) queries into (B*7, 1, 256). Each query is processed through SAM3 in its own 'slot 1' position. image_ids = arange(B).repeat_interleave(7) tells _get_img_feats and _embed_pixels to expand backbone features by indexing (no copy). Output (B*7, 1, H, W) is reshaped back to (B, 7, H, W).",
-      "file": "models/qwen2sam_detexture.py",
+      "file": "models/qwen2sam_detecture.py",
       "method": "run_sam3_semantic",
       "effect": "Each texture query gets unbiased attention. Architecturally bypasses SAM's pretrained 'first position only' habit. Memory cost: ~+530 MB on H100 (fits comfortably).",
       "nan_trap_fix": "Critical: with seq_len=1, passing prompt_key_padding_mask produces Softmax([-inf]) = NaN. Solution: pass key_padding_mask=None for both Fusion Encoder and SegHead cross_attend_prompt. PAD slots run unmasked, produce garbage logits that the loss/argmax ignores."

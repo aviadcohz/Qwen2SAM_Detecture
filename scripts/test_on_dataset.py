@@ -3,12 +3,12 @@
 Run inference on any test dataset using a saved checkpoint.
 
 Usage:
-    cd /home/aviad/Qwen2SAM_DeTexture
+    cd /home/aviad/Qwen2SAM_Detecture
     python scripts/test_on_dataset.py \
-        --config configs/detexture.yaml \
+        --config configs/detecture.yaml \
         --checkpoint checkpoints/best.pt \
-        --test-metadata /home/aviad/datasets/ADE20k_DeTexture/metadata.json \
-        --output-dir checkpoints/test_ade20k_detexture
+        --test-metadata /home/aviad/datasets/ADE20k_Detecture/metadata.json \
+        --output-dir checkpoints/test_ade20k_detecture
 """
 
 import argparse
@@ -25,8 +25,8 @@ import cv2
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from models.qwen2sam_detexture import Qwen2SAMDeTexture, MAX_TEXTURES
-from data.dataset import DeTextureDataset, DeTextureCollator
+from models.qwen2sam_detecture import Qwen2SAMDetecture, MAX_TEXTURES
+from data.dataset import DetectureDataset, DetectureCollator
 from training.utils import load_config, load_checkpoint
 from training.monitor import _compute_ari, _colorize_mask
 
@@ -54,7 +54,7 @@ def compute_matched_miou(pred, gt, k_pred, k_gt):
 
 def main():
     parser = argparse.ArgumentParser(description="Test model on a dataset")
-    parser.add_argument("--config", type=str, default="configs/detexture.yaml")
+    parser.add_argument("--config", type=str, default="configs/detecture.yaml")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt")
     parser.add_argument("--test-metadata", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -71,7 +71,7 @@ def main():
 
     # ---- Load model + checkpoint ----
     print(f"Loading model...")
-    model = Qwen2SAMDeTexture(cfg, device=str(device))
+    model = Qwen2SAMDetecture(cfg, device=str(device))
     ckpt_path = args.checkpoint
     state = torch.load(ckpt_path, map_location=device)
     epoch = load_checkpoint(model, None, ckpt_path, device=str(device))
@@ -79,12 +79,12 @@ def main():
     model.eval()
 
     # ---- Load test dataset ----
-    test_ds = DeTextureDataset(
+    test_ds = DetectureDataset(
         args.test_metadata,
         image_size=cfg["data"].get("image_size", 1008),
         augment=False,
     )
-    collator = DeTextureCollator(model.processor, inference=True)
+    collator = DetectureCollator(model.processor, inference=True)
     test_loader = torch.utils.data.DataLoader(
         test_ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=collator,
     )

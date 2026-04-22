@@ -11,7 +11,7 @@
   },
 
   "what_worked": {
-    "in_domain_stable": "ADE20K_DeTexture live inference is STABLE at 0.70+ across all epochs. No drift. The architecture fundamentally works for in-domain data.",
+    "in_domain_stable": "ADE20K_Detecture live inference is STABLE at 0.70+ across all epochs. No drift. The architecture fundamentally works for in-domain data.",
     "embed_regen_marginal": "Regenerated embeddings improved ep5 test from 0.6861 to 0.6921 (+0.006). Small but confirms the extraction alignment matters.",
     "plug_converges": "Distillation loss converged cleanly to 0.157. The projector successfully learns to land in SAM's manifold (for ADE20K inputs)."
   },
@@ -34,7 +34,7 @@
     },
     "hypothesis_2_domain_gap": {
       "claim": "Projector overfits to ADE20K distribution, failing on RWTD",
-      "test": "Control group: ran inference_forward on in-domain ADE20K_DeTexture.",
+      "test": "Control group: ran inference_forward on in-domain ADE20K_Detecture.",
       "result": "In-domain stable 0.700→0.707. Cross-domain drifts 0.692→0.618.",
       "verdict": "CONFIRMED — domain gap is real."
     },

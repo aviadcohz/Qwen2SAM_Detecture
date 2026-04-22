@@ -1,7 +1,10 @@
 \documentclass{article}
 
-% NeurIPS 2025 style
-\usepackage[preprint]{neurips_2025}
+% NeurIPS 2026 — Main Track, double-blind submission (default options).
+% The style file automatically anonymises authors and adds line numbers.
+% After acceptance, switch to \usepackage[main, final]{neurips_2026}
+% For arXiv preprint before / after the decision, use \usepackage[preprint]{neurips_2026}
+\usepackage{neurips_2026}
 
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
@@ -18,10 +21,10 @@
 \usepackage{subcaption}
 \usepackage{multirow}
 
-\title{Qwen2SAM-DeTexture: End-to-End VLM-Guided Multi-Texture Segmentation via Native-Space Bridging and Multiplexed Grounding}
+\title{Qwen2SAM-Detecture: End-to-End VLM-Guided Multi-Texture Segmentation via Native-Space Bridging and Multiplexed Grounding}
 
-% Authors — anonymous for submission
-\author{
+% Anonymised for double-blind review. The ``default'' style option hides this block.
+\author{%
   Anonymous Authors
 }
 
@@ -33,7 +36,7 @@
 % ABSTRACT
 % ============================================================================
 \begin{abstract}
-Recent work on texture-aware segmentation---most notably TextureSAM, which demonstrated that foundation segmentation models carry a systematic shape bias that can be mitigated through texture-augmented fine-tuning---has established that \emph{what} to segment in texture-dominant scenes is a solvable problem. However, the complementary question of \emph{how many} and \emph{which} textures to segment remains unaddressed: TextureSAM and the SAM family operate as class-agnostic prompt-based models that require external specification of regions of interest, while Vision-Language Models (VLMs) that could provide such specification struggle with dense, multi-target grounding in a single forward pass. We present \textbf{Qwen2SAM-DeTexture}, an end-to-end architecture that closes this gap by coupling a VLM's open-vocabulary reasoning with a texture-aware segmentation decoder for parallel, multi-texture segmentation. Through systematic ablation we identify and resolve five architectural pathologies that emerge when extending \texttt{[SEG]}-token grounding to the multi-target regime: (i)~\emph{Context Leakage}, whereby causal attention contaminates downstream \texttt{[SEG]} representations (inter-texture cosine similarity of 0.74 under shared context vs.\ 0.16 under isolation); (ii)~\emph{Slot-1 Positional Bias}, where SAM's cross-attention allocates 90.5\% of pixels to the first query regardless of semantic content; (iii)~\emph{Count Collapse vs.\ Language Collapse}, a binary dilemma in multi-modal LoRA training where uniform LM loss causes single-texture termination while binary masking causes catastrophic forgetting; (iv)~\emph{Directional Drift}, where an over-parameterized projector memorizes domain-specific manifold directions; and (v)~\emph{Bottleneck Semantic Squash}, whereby projecting a VLM's 4096-dim grounding representation through a 256-dim square bottleneck destroys the semantic richness a pretrained segmentation backbone can readily interpret. A parallel Zero-Shot experiment confirms the latter: SAM~3 with a hand-crafted, object-aware text prompt achieves \textbf{0.928 mIoU on RWTD without any training}, reframing the projector's role from \emph{learning a new semantic mapping} to \emph{preserving one SAM already knows}. Our architecture introduces a \textbf{Bridge-to-Native projector} that maps Qwen's \texttt{[SEG]} hidden state into SAM~3's native 1024-dim text-encoder width via a single trainable linear layer and then hands the final projection back to SAM~3's own pretrained resizer (kept frozen), together with a sharp \textbf{exponential LM-loss cliff} that isolates the \texttt{[SEG]} token geometrically while anchoring all surrounding tokens linguistically, a \textbf{permanently frozen SAM} (no LoRA), and a \textbf{two-stage curriculum} with ${\sim}8.2$M trainable parameters. We further contribute the \textbf{DeTexture Pipeline}, a geometry-first texture mining framework for curating training data from large-scale datasets, and the \textbf{Real-World Texture Dataset (RWTD)}, a benchmark of 253 in-the-wild texture transition scenes.
+Recent work on texture-aware segmentation---most notably TextureSAM, which demonstrated that foundation segmentation models carry a systematic shape bias that can be mitigated through texture-augmented fine-tuning---has established that \emph{what} to segment in texture-dominant scenes is a solvable problem. However, the complementary question of \emph{how many} and \emph{which} textures to segment remains unaddressed: TextureSAM and the SAM family operate as class-agnostic prompt-based models that require external specification of regions of interest, while Vision-Language Models (VLMs) that could provide such specification struggle with dense, multi-target grounding in a single forward pass. We present \textbf{Qwen2SAM-Detecture}, an end-to-end architecture that closes this gap by coupling a VLM's open-vocabulary reasoning with a texture-aware segmentation decoder for parallel, multi-texture segmentation. Through systematic ablation we identify and resolve five architectural pathologies that emerge when extending \texttt{[SEG]}-token grounding to the multi-target regime: (i)~\emph{Context Leakage}, whereby causal attention contaminates downstream \texttt{[SEG]} representations (inter-texture cosine similarity of 0.74 under shared context vs.\ 0.16 under isolation); (ii)~\emph{Slot-1 Positional Bias}, where SAM's cross-attention allocates 90.5\% of pixels to the first query regardless of semantic content; (iii)~\emph{Count Collapse vs.\ Language Collapse}, a binary dilemma in multi-modal LoRA training where uniform LM loss causes single-texture termination while binary masking causes catastrophic forgetting; (iv)~\emph{Directional Drift}, where an over-parameterized projector memorizes domain-specific manifold directions; and (v)~\emph{Bottleneck Semantic Squash}, whereby projecting a VLM's 4096-dim grounding representation through a 256-dim square bottleneck destroys the semantic richness a pretrained segmentation backbone can readily interpret. A parallel Zero-Shot experiment confirms the latter: SAM~3 with a hand-crafted, object-aware text prompt achieves \textbf{0.928 mIoU on RWTD without any training}, reframing the projector's role from \emph{learning a new semantic mapping} to \emph{preserving one SAM already knows}. Our architecture introduces a \textbf{Bridge-to-Native projector} that maps Qwen's \texttt{[SEG]} hidden state into SAM~3's native 1024-dim text-encoder width via a single trainable linear layer and then hands the final projection back to SAM~3's own pretrained resizer (kept frozen); a \textbf{Shifted-Zero LM-loss cliff} that geometrically isolates the token immediately after each \texttt{[SEG]} while applying full linguistic pressure on \texttt{[SEG]} itself (restoring the emission-learning gradient that a na\"ive $\lambda_{\text{SEG}} = 0$ cliff silently destroys); \textbf{masked-row trainable SEG rows} with warm-start from \texttt{<|im\_end|>} that unlock \texttt{[SEG]} emission at inference without disturbing the rest of Qwen's vocabulary; \textbf{batch multiplexing} that bypasses SAM's Slot-1 Positional Bias by forcing each texture query into its own independent forward pass; a \textbf{Winner-Takes-All pixel assignment} with a learned dustbin channel that produces a mathematically consistent, non-overlapping partition; a \textbf{permanently frozen SAM} (no LoRA); and a \textbf{two-stage curriculum} with ${\sim}8.2$M trainable parameters. We further contribute the \textbf{Detecture Pipeline}, a geometry-first texture mining framework for curating training data from large-scale datasets, and the \textbf{Real-World Texture Dataset (RWTD)}, a benchmark of 253 in-the-wild texture transition scenes.
 \end{abstract}
 
 % ============================================================================
@@ -49,27 +52,27 @@ This limitation becomes particularly acute for \textbf{texture segmentation}, a 
 
 A fundamental reason for this gap is that SAM---despite its remarkable zero-shot segmentation capability---lacks \emph{semantic understanding} of what it segments. SAM excels at delineating regions given geometric prompts (points, boxes, masks), but it has no internal representation of \emph{why} a boundary exists or \emph{what material} lies on either side of it. For texture segmentation, this distinction is critical: the boundary between wet sand and dry sand may be visually subtle yet semantically unambiguous to a language model that understands material properties. We therefore conceptualize the VLM as the semantic ``brain'' that identifies and describes texture regions, and SAM as the geometric ``eyes'' that execute precise spatial delineation. The architecture's challenge is to bridge these two modalities---mapping linguistic descriptions into the geometric prompt space---without corrupting either the VLM's language capabilities or SAM's spatial precision.
 
-We present \textbf{Qwen2SAM-DeTexture}, an end-to-end architecture that realizes this brain-eyes coupling. Our central question is: \textbf{Can a VLM-guided system autonomously identify, describe, and segment multiple texture regions simultaneously, producing a consistent image partition in one forward pass?}
+We present \textbf{Qwen2SAM-Detecture}, an end-to-end architecture that realizes this brain-eyes coupling. Our central question is: \textbf{Can a VLM-guided system autonomously identify, describe, and segment multiple texture regions simultaneously, producing a consistent image partition in one forward pass?}
 
 We answer affirmatively, but arriving at our final design required uncovering and resolving five distinct \emph{architectural pathologies} that emerge when extending single-target \texttt{[SEG]}-token grounding to the multi-target regime. These pathologies are not specific to texture segmentation; they are general failure modes of any system that combines causal VLM decoding with SAM-family decoders for multi-target prediction.
 
 \paragraph{Data-Architecture Co-design.}
-Our research follows a \emph{data-architecture co-design} philosophy. For training data, we build on TextureSAM's~\cite{texturesam} texture-augmented ADE20K dataset, extending it with a geometry-first scoring pipeline (the DeTexture Pipeline) that mines the most texture-rich samples and an automated VLM-based annotation stage that generates natural language descriptions for each texture region (Section~\ref{sec:data}). This data ecosystem also produced two evaluation benchmarks: ADE20K\_DeTexture (in-domain) and RWTD (out-of-domain, adopted from TextureSAM~\cite{texturesam}). Early evaluation on RWTD revealed the Slot-1 Positional Bias in SAM's decoder (invisible on cleaner benchmarks), and the cross-domain gap between ADE20K and RWTD exposed Directional Drift in our projector (undetectable when training and evaluation share the same domain). In this sense, the dataset \emph{discovered} the architectural problems.
+Our research follows a \emph{data-architecture co-design} philosophy. For training data, we build on TextureSAM's~\cite{texturesam} texture-augmented ADE20K dataset, extending it with a geometry-first scoring pipeline (the Detecture Pipeline) that mines the most texture-rich samples and an automated VLM-based annotation stage that generates natural language descriptions for each texture region (Section~\ref{sec:data}). This data ecosystem also produced two evaluation benchmarks: ADE20K\_Detecture (in-domain) and RWTD (out-of-domain, adopted from TextureSAM~\cite{texturesam}). Early evaluation on RWTD revealed the Slot-1 Positional Bias in SAM's decoder (invisible on cleaner benchmarks), and the cross-domain gap between ADE20K and RWTD exposed Directional Drift in our projector (undetectable when training and evaluation share the same domain). In this sense, the dataset \emph{discovered} the architectural problems.
 
 \paragraph{Contributions.} We make the following contributions:
 
 \begin{enumerate}
-    \item \textbf{An End-to-End Multi-Target Grounding Architecture.} We propose a system that maps rich linguistic texture descriptions directly to geometric segmentation via dedicated \texttt{[SEG]} grounding tokens, producing a spatially consistent partition in a single forward pass with ${\sim}8.2$M trainable parameters atop a frozen Qwen3-VL-8B and a permanently frozen SAM~3 backbone.
+    \item \textbf{An End-to-End Multi-Target Grounding Architecture.} We propose a system that maps rich linguistic texture descriptions directly to geometric segmentation via dedicated \texttt{[SEG]} grounding tokens, producing a spatially consistent partition in a single forward pass with ${\sim}8.2$M trainable parameters atop a frozen Qwen3-VL-8B and a permanently frozen SAM~3 backbone, arbitrated by a \textbf{Winner-Takes-All layer with a learned dustbin channel} that produces a mathematically consistent, non-overlapping image partition. A \textbf{two-stage curriculum with a $10\times$ Bridge LR decay at Qwen-thaw} stabilises co-adaptation (resolving \emph{Latent Co-Adaptation Churn}) without any SAM fine-tuning.
 
     \item \textbf{Bridge-to-Native-Space Projection.} We demonstrate that the conventional square-bottleneck projector design ($4096 \to 512 \to 256$) destroys the semantic richness a pretrained segmentation backbone can already interpret. Instead, we project into SAM~3's \emph{native} 1024-dim text-encoder width with a single trainable linear layer and reuse SAM~3's own pretrained $1024 \to 256$ resizer (kept frozen) for the final step. This turns the cross-model alignment problem from a \emph{learning} problem into a \emph{shape-matching} problem.
 
-    \item \textbf{The Block-Diagonal Attention Mask.} We introduce a custom causal attention mask that prevents \emph{Context Leakage} between sequential texture descriptions, reducing inter-\texttt{[SEG]} cosine similarity from 0.74 to 0.16 and enabling independent, parallel grounding of multiple texture targets.
+    \item \textbf{Decoupling Multi-Query Grounding: Block-Diagonal Attention + Batch Multiplexing.} We resolve two independent failure modes of parallel \texttt{[SEG]}-token grounding. A custom block-diagonal attention mask prevents \emph{Context Leakage} between sequential texture descriptions (reducing inter-\texttt{[SEG]} cosine similarity from 0.74 to 0.16). A batch-multiplexing reshape of the query tensor ($\mathbb{R}^{B \times K \times D} \to \mathbb{R}^{(BK) \times 1 \times D}$) forces each texture query into its own independent ``Slot 1'' forward pass, bypassing the 90.5\,\% / 0.0\,\% pretrained positional allocation bias of SAM~3's multi-prompt decoder.
 
-    \item \textbf{Exponential LM-Loss Cliff.} We identify the fundamental \emph{Language Collapse vs.\ Count Collapse} dilemma in multi-modal LoRA training and resolve it with a sharp exponential weighting schedule: $\mathrm{Weight}(d) = 1 - e^{-2d}$ where $d$ is the token-wise distance to the nearest \texttt{[SEG]}. The grounding token itself is assigned weight zero (total geometric freedom), while every surrounding token receives near-full linguistic supervision---eliminating the continuous DICE/LM tug-of-war that smoother weighting schedules induce.
+    \item \textbf{Shifted-Zero LM-Loss Cliff and Masked-Row Trainable Grounding.} We identify the fundamental \emph{Count Collapse vs.\ Language Collapse} dilemma in multi-modal LoRA training and a subsequent \emph{Emission Failure} pathology that emerges once the dilemma is na\"ively resolved. Our solution has two components. First, a \emph{Shifted-Zero cliff} places the zero-weight slot one token \emph{past} \texttt{[SEG]} rather than at \texttt{[SEG]} itself---preserving geometric freedom for the grounding embedding while restoring the emission-learning gradient that a na\"ive $\lambda_{\text{SEG}} = 0$ cliff silently destroys under causal-shift semantics. Second, \emph{masked-row training} with \emph{warm-start from \texttt{<|im\_end|>}} unfreezes exactly the SEG rows of \texttt{embed\_tokens} and \texttt{lm\_head} (16{,}384 effective parameters) via a gradient-mask hook, calibrating \texttt{lm\_head[SEG]} so the token can actually be chosen at inference. Together they raise honest live RWTD mIoU from 0.000 to 0.794 at epoch 16.
 
     \item \textbf{Systematic Characterization of Multi-Target Grounding Pathologies.} Through rigorous ablation, we identify and formally characterize five pathologies---Context Leakage, Slot-1 Positional Bias, the Count/Language Collapse dilemma, Directional Drift, and Bottleneck Semantic Squash---that affect any architecture combining causal VLM decoding with SAM-family decoders for multi-target prediction.
 
-    \item \textbf{A Complete Data Ecosystem.} We contribute the DeTexture Pipeline (geometry-first texture mining), ADE20K\_DeTexture (custom in-domain test set), and VLM-annotated RWTD (adopted out-of-domain benchmark), forming a dual-evaluation strategy that exposes cross-domain pathologies invisible to single-benchmark evaluation.
+    \item \textbf{A Complete Data Ecosystem.} We contribute the Detecture Pipeline (geometry-first texture mining), ADE20K\_Detecture (custom in-domain test set), and VLM-annotated RWTD (adopted out-of-domain benchmark), forming a dual-evaluation strategy that exposes cross-domain pathologies invisible to single-benchmark evaluation.
 \end{enumerate}
 
 % ============================================================================
@@ -103,7 +106,7 @@ Classical panoptic segmentation approaches---Mask2Former~\cite{mask2former}, Pan
 
 \subsection{Texture Segmentation and Datasets}
 
-Texture segmentation has a rich history predating deep learning, from Brodatz-based evaluations to the Describable Textures Dataset (DTD)~\cite{dtd}, KTH-TIPS~\cite{kth}, and texture subsets of MS-COCO Stuff~\cite{cocostuff}. However, these benchmarks predominantly feature isolated texture patches or well-separated regions under controlled conditions. They do not capture the challenging \emph{texture transition} scenarios common in real-world imagery: gradual boundaries between sand and water, interleaving patterns of brick and mortar, or complex junctions of concrete, grass, and gravel. TextureSAM's RWTD benchmark~\cite{texturesam} and our extended DeTexture mining pipeline specifically target these challenging in-the-wild cases, providing both evaluation benchmarks and a reproducible methodology for curating texture-rich training data from large-scale annotated datasets.
+Texture segmentation has a rich history predating deep learning, from Brodatz-based evaluations to the Describable Textures Dataset (DTD)~\cite{dtd}, KTH-TIPS~\cite{kth}, and texture subsets of MS-COCO Stuff~\cite{cocostuff}. However, these benchmarks predominantly feature isolated texture patches or well-separated regions under controlled conditions. They do not capture the challenging \emph{texture transition} scenarios common in real-world imagery: gradual boundaries between sand and water, interleaving patterns of brick and mortar, or complex junctions of concrete, grass, and gravel. TextureSAM's RWTD benchmark~\cite{texturesam} and our extended Detecture mining pipeline specifically target these challenging in-the-wild cases, providing both evaluation benchmarks and a reproducible methodology for curating texture-rich training data from large-scale annotated datasets.
 
 % ============================================================================
 % 3. METHODOLOGY
@@ -122,13 +125,13 @@ Nevertheless, this heuristic probing phase yielded two foundational insights. Fi
 
 These insights motivated the adoption of \textbf{Qwen3-VL-8B} as the central architectural foundation. By leveraging Qwen3-VL's superior visual reasoning capabilities and higher-dimensional latent space (4096-D), we built a fully end-to-end architecture capable of extracting rich, spatially-aware hidden states at dedicated \texttt{[SEG]} token boundaries, which we project into SAM 3's \emph{native} 1024-dim text-encoder space via a trainable Bridge and then hand to SAM 3's own pretrained (frozen) $1024 \to 256$ resizer.
 
-The resulting architecture (Figure~\ref{fig:architecture}) comprises four components: a frozen Qwen3-VL-8B backbone with lightweight LoRA adapters, the \textbf{Bridge} ($\mathrm{Linear}(4096, 1024) + \mathrm{LN} + \mathrm{GELU} + \mathrm{Dropout}(0.4)$, $\sim 4.2$M trainable parameters) composed with SAM~3's frozen pretrained resizer, a \emph{permanently frozen} SAM~3 mask decoder (no LoRA), and a Winner-Takes-All pixel assignment layer. Training employs a two-stage curriculum with the exponential LM-loss cliff and ${\sim}8.2$M trainable parameters total. The design addresses five pathologies that we characterize in the following subsections.
+The resulting architecture (Figure~\ref{fig:architecture}) comprises four components: a frozen Qwen3-VL-8B backbone with lightweight LoRA adapters and masked-row trainable SEG rows, the \textbf{Bridge} ($\mathrm{Linear}(4096, 1024) + \mathrm{LN} + \mathrm{GELU} + \mathrm{Dropout}(0.4)$, $\sim 4.2$M trainable parameters) composed with SAM~3's frozen pretrained resizer, a \emph{permanently frozen} SAM~3 mask decoder (no LoRA), and a Winner-Takes-All pixel assignment layer. Training employs a two-stage curriculum with the Shifted-Zero LM-loss cliff and ${\sim}8.2$M trainable parameters total. The design addresses five pathologies that we characterize in the following subsections.
 
 \begin{figure}[t]
     \centering
     % \includegraphics[width=\textwidth]{figures/architecture.pdf}
     \fbox{\parbox{0.95\textwidth}{\centering\vspace{2cm}\textbf{[Architecture Diagram Placeholder]}\\\small Qwen3-VL $\to$ Block-Diagonal Mask $\to$ Bridge ($4096 \to 1024$) $\to$ SAM's frozen resizer ($1024 \to 256$) $\to$ Batch-Multiplexed SAM3 (frozen) $\to$ WTA\vspace{2cm}}}
-    \caption{\textbf{Qwen2SAM-DeTexture Architecture.} The VLM generates texture descriptions with \texttt{[SEG]} tokens under a block-diagonal attention mask that isolates each texture's context. The Bridge (trainable, $\sim 4.2$M params) widens the \texttt{[SEG]} embedding into SAM~3's native 1024-dim text space, then SAM's own pretrained resizer (frozen) projects to the 256-dim decoder query space; batch multiplexing ensures each query occupies an independent ``Slot~1.'' Winner-Takes-All pixel assignment produces a non-overlapping partition. Only ${\sim}8.2$M parameters (shaded) are trainable; SAM~3 is frozen throughout.}
+    \caption{\textbf{Qwen2SAM-Detecture Architecture.} The VLM generates texture descriptions with \texttt{[SEG]} tokens under a block-diagonal attention mask that isolates each texture's context. The Bridge (trainable, $\sim 4.2$M params) widens the \texttt{[SEG]} embedding into SAM~3's native 1024-dim text space, then SAM's own pretrained resizer (frozen) projects to the 256-dim decoder query space; batch multiplexing ensures each query occupies an independent ``Slot~1.'' Winner-Takes-All pixel assignment produces a non-overlapping partition. Only ${\sim}8.2$M parameters (shaded) are trainable; SAM~3 is frozen throughout.}
     \label{fig:architecture}
 \end{figure}
 
@@ -184,7 +187,7 @@ The bias persists identically after swapping texture assignments between slots a
 Rather than passing multiple queries through SAM's multi-prompt pathway, we reshape the query tensor from $\mathbb{R}^{B \times K \times D}$ to $\mathbb{R}^{(B \cdot K) \times 1 \times D}$, replicating the image features accordingly via an index mapping. This forces each texture query to occupy \emph{its own} Slot~1 in an independent SAM forward pass, bypassing the positional bias entirely. The resulting masks $\hat{\mathbf{m}}_k \in [0,1]^{H \times W}$ for $k = 1, \ldots, K$ are then recombined along the batch dimension for competitive pixel assignment. This transformation is computationally equivalent to $K$ independent SAM passes but is implemented as a single batched operation, preserving GPU efficiency. Empirically, batch multiplexing immediately recovered performance to 99.5\% of the zero-shot baseline (mIoU 0.703 vs.\ 0.706) at epoch~5.
 
 % ----------------------------------------------------------------------------
-\subsection{The Language Collapse Dilemma and the Exponential LM Cliff}
+\subsection{Freeing the Grounding Token: Shifted-Zero Cliff and Trainable Emission Rows}
 \label{sec:count_collapse}
 
 \paragraph{Pathology 1: Count Collapse under Uniform LM Loss.}
@@ -193,26 +196,41 @@ We observe that na\"ive end-to-end co-training of a VLM with segmentation losses
 \paragraph{Pathology 2: Language Collapse under Binary Loss Masking.}
 The na\"ive fix---applying $-100$ to \emph{all} text tokens and computing LM loss exclusively on \texttt{[SEG]} positions---prevents Count Collapse but introduces a symmetric failure: \emph{Language Collapse}. With zero LM gradient on text tokens, the LoRA adapters receive gradients exclusively from the spatial segmentation path and undergo catastrophic forgetting of their linguistic prior within a few epochs. The model loses the ability to generate coherent texture descriptions and ceases to emit \texttt{[SEG]} tokens during inference. Crucially, the segmentation architecture itself remains fully functional when bypassing generation with ground-truth descriptions---confirming that the failure is purely linguistic, not geometric.
 
-This reveals a fundamental dilemma: \emph{binary} loss masking creates a binary failure mode. Full text loss $\to$ Count Collapse; zero text loss $\to$ Language Collapse. The solution requires an \emph{isolation} of the grounding token from linguistic supervision while retaining full supervision on all surrounding tokens.
+This reveals a fundamental dilemma: \emph{binary} loss masking creates a binary failure mode. Full text loss $\to$ Count Collapse; zero text loss $\to$ Language Collapse.
 
 \paragraph{An Intermediate Cosine-Decayed Variant.}
-An earlier iteration of our architecture smoothed the binary mask into a per-block cosine decay from $\lambda_{\max} = 1.0$ at the block start down to $\lambda_{\min} = 0.05$ at the \texttt{[SEG]} token. This prevented catastrophic forgetting (live-inference RWTD mIoU recovered from 0.136 to 0.694) but introduced a \emph{continuous} tug-of-war: with non-zero linguistic pressure on nearly every token in each block, the Dice mask loss could not drive the grounding embedding aggressively enough toward geometric optima. Empirically, training Dice plateaued at 0.43 and honest (exactly-K) RWTD mIoU stalled at 0.694.
+An earlier iteration smoothed the binary mask into a per-block cosine decay from $\lambda_{\max} = 1.0$ at the block start down to $\lambda_{\min} = 0.05$ at the \texttt{[SEG]} token. This prevented catastrophic forgetting (live-inference RWTD mIoU recovered from 0.136 to 0.694) but introduced a \emph{continuous} tug-of-war: with non-zero linguistic pressure on nearly every token in each block, the Dice mask loss could not drive the grounding embedding aggressively enough toward geometric optima. Empirically, training Dice plateaued at 0.43 and honest (exactly-K) RWTD mIoU stalled at 0.694.
 
-\paragraph{Our Solution: Exponential LM Cliff.}
-We replace the gentle cosine schedule with a sharp exponential cliff centred on the \texttt{[SEG]} token itself. Let $d(i)$ denote the token-wise distance from position $i$ to the nearest assistant-region \texttt{[SEG]} token. We define:
+\paragraph{Exponential Cliff: the Obvious-But-Broken Version.}
+The apparent fix is to replace the gentle cosine with a sharp exponential cliff centred on the \texttt{[SEG]} token. Let $d(i)$ be the token-wise distance from position $i$ to the nearest assistant-region \texttt{[SEG]}; the ``obvious'' cliff is $\lambda(\text{SEG}) = 0$ and $\lambda(i) = 1 - e^{-\alpha d(i)}$ elsewhere, with $\alpha = 2.0$ yielding $\lambda = 0.865$ at distance one, $0.982$ at distance two, $\approx 1.0$ at distance $\geq 3$. This removes the continuous tug-of-war---gradients from the Dice path and the LM path only coincide at the geometrically-isolated \texttt{[SEG]} token---and recovers the teacher-forced (Oracle) regime: mIoU on RWTD under teacher-forced \texttt{[SEG]} embeddings climbs to 0.738 at epoch 12. Under \emph{live} (free-generation) inference, however, this design fails completely: the model never emits \texttt{[SEG]} at all, substituting \texttt{<|tool\_call|>} or \texttt{<|im\_end|>} in its place, and downstream RWTD mIoU collapses to 0.000.
+
+\paragraph{Diagnosis: the Emission-Zero Conflation.}
+Causal-LM loss at position $i$ supervises the \emph{prediction of token $i{+}1$}. The ``obvious'' cliff sets $\lambda(\text{SEG}) = 0$ in order to free $\mathbf{h}_{\text{SEG}}$ geometrically---but this same weight also controls the gradient that trains $\mathbf{h}_{\text{SEG}}$ to predict whatever comes \emph{after} \texttt{[SEG]} (typically a newline or the next \texttt{TEXTURE\_k:} marker). Zeroing it removes the ``continue correctly after a SEG emission'' signal, and with it the principal pathway that would otherwise teach the model to emit \texttt{[SEG]} as the natural prelude to the next region. Free-generation therefore substitutes pretrained-high-probability special tokens that Qwen already associates with ``end of a thought block''.
+
+\paragraph{Our Solution (Part A): Shifted-Zero Cliff.}
+We shift the zero one position forward:
 \begin{equation}
     \lambda_{\text{LM}}(i) = \begin{cases}
-        0 & \text{if } i \in \mathcal{S}_{\text{asst}} \\
+        0 & \text{if } i - 1 \in \mathcal{S}_{\text{SEG,asst}} \\
         1 - e^{-\alpha \cdot d(i)} & \text{otherwise}
-    \end{cases}
+    \end{cases}, \qquad \alpha = 2.0.
 \end{equation}
-with $\alpha = 2.0$ and $\mathcal{S}_{\text{asst}}$ the set of assistant-region \texttt{[SEG]} positions. The weighted LM loss is:
+That is, the position \emph{after} each assistant-region \texttt{[SEG]} carries weight zero (a geometrically unused continuation slot), while the \texttt{[SEG]} position itself carries weight one. Under causal-shift semantics, $\lambda(\text{SEG}) = 1$ restores the emission-learning gradient on the post-SEG continuation; this gradient is predominantly syntactic (newlines, region markers) rather than semantic, so the Dice path and the LM path still do not conflict at the grounding embedding itself. The weighted LM loss is:
 \begin{equation}
-    \mathcal{L}_{\text{LM}}^{\text{exp}} = \frac{\sum_{i \in \mathcal{A}} \lambda_{\text{LM}}(i) \cdot \ell_{\text{CE}}(i)}{\sum_{i \in \mathcal{A}} \lambda_{\text{LM}}(i)}
+    \mathcal{L}_{\text{LM}}^{\text{SZ}} = \frac{\sum_{i \in \mathcal{A}} \lambda_{\text{LM}}(i) \cdot \ell_{\text{CE}}(i)}{\sum_{i \in \mathcal{A}} \lambda_{\text{LM}}(i)}
 \end{equation}
-where $\mathcal{A}$ denotes the set of assistant (non-prefix) token positions. Concretely, the weights are $\lambda_{\text{LM}}(0) = 0.000$ (the \texttt{[SEG]} token), $\lambda_{\text{LM}}(1) = 0.865$, $\lambda_{\text{LM}}(2) = 0.982$, $\lambda_{\text{LM}}(3) = 0.998$, and $\lambda_{\text{LM}}(d) \approx 1.0$ for $d \geq 4$.
+where $\mathcal{A}$ denotes the set of assistant (non-prefix) token positions.
 
-This ``cliff'' structure isolates the grounding token \emph{completely} from linguistic supervision (enabling aggressive Dice optimization on \texttt{[SEG]}) while applying \emph{near-full} LM supervision to every surrounding token (preventing language drift). Unlike a cosine decay, there is no continuous gradient conflict: within one token of \texttt{[SEG]}, the LM pressure is already at 87\% of its full value, and by two tokens out it is at 98\%.
+\paragraph{Our Solution (Part B): Masked-Row Trainable SEG with Warm-Start.}
+Shifted-Zero alone remains insufficient. Even with the corrected weighting, live-inference RWTD mIoU stays at 0.000 while the Oracle climbs. Probing \texttt{lm\_head} reveals a second failure: the output-projection row \texttt{lm\_head.weight[SEG]}---the row whose inner product with the final hidden state produces \texttt{[SEG]}'s logit---is frozen at its random initialisation, and LoRA on \texttt{q\_proj}/\texttt{v\_proj} cannot reach it. With an uncalibrated \texttt{lm\_head[SEG]}, the SEG logit is dominated by logits from well-trained rows like \texttt{<|tool\_call|>} or \texttt{<|im\_end|>}, and these tokens are chosen instead.
+
+We resolve this with two complementary mechanisms:
+\begin{enumerate}
+    \item \textbf{Warm-start from \texttt{<|im\_end|>}.} At model initialisation we copy the pretrained rows \texttt{lm\_head.weight[<|im\_end|>]} and \texttt{embed\_tokens.weight[<|im\_end|>]} into the corresponding SEG rows. This places \texttt{[SEG]} near a token Qwen already associates with ``finalise a region of thought'' in both the input and output embedding spaces---a semantically appropriate anchor that avoids the random-init cliff.
+    \item \textbf{Masked-row gradient routing.} During Stage 2, we unfreeze the full \texttt{embed\_tokens.weight} and \texttt{lm\_head.weight} tensors (so PyTorch computes gradients for them at all) and register a gradient hook that zeros every row except the SEG row. This restricts actual weight updates to the two 8192-dimensional SEG rows---16{,}384 effective parameters---while leaving the remaining ${\sim}150$K rows of each tensor exactly as pretrained. The SEG rows are added to the optimiser in their own parameter group at a dedicated learning rate.
+\end{enumerate}
+
+Together, Shifted-Zero and Masked-Row cure emission: live-inference RWTD mIoU jumps from 0.000 to 0.794 at epoch 16 (Section~\ref{sec:experiments}), while Oracle mIoU continues its trajectory from 0.738 to 0.781 at the same epoch---confirming that the live gap was a pure emission problem, not a geometric one.
 
 \paragraph{Prompt-Template Filtering.}
 The user prompt includes the literal string ``\texttt{<|seg|>}'' in its format-template example, which tokenises to the SEG special token within the user message. All distance computations and \texttt{[SEG]}-position lookups are filtered to the assistant region only, so prompt-template SEGs are never treated as real grounding outputs.
@@ -281,32 +299,35 @@ where $\hat{m}_{\text{dust}}$ is produced by a learned 4096-dimensional dustbin 
 
 Earlier iterations of our architecture employed three-stage curricula that ultimately unfroze SAM via an orthogonal LoRA in its cross-attention layers. Across many ablation runs, every SAM-unfreezing configuration produced the same signature: a transient in-domain gain on ADE20K followed by an out-of-domain regression on RWTD (one such run lost 4.6 mIoU between its middle and final stages). Combined with the Zero-Shot SAM~3 upper-bound experiment (Section~\ref{sec:drift}) showing that SAM~3 already reaches 0.928 mIoU on RWTD without any training, the conclusion is unambiguous: \emph{SAM must be treated as a pretrained semantic asset, not a fine-tunable module.} Our final architecture therefore adopts a \textbf{two-stage curriculum} and permanently freezes SAM.
 
-\paragraph{Stage 1: Bridge Warmup (Epochs 1--12).}
-Only the Bridge, multi-texture mask head, and dustbin embedding are trainable (${\sim}4.4$M parameters). Qwen LoRA is frozen; SAM (including the reused resizer) is frozen. The Bridge absorbs the random-initialisation shock and learns the shape-matching $4096 \to 1024$ map into SAM's native text space. Because the 4.2M-parameter Bridge is substantially larger than the prior 2.1M bottleneck, we extend the warmup to 12 epochs to allow the heavy Dropout(0.4) regularization to stabilise the Bridge's output distribution before any linguistic gradients enter the system.
+\paragraph{Stage 1: Bridge Warmup (Epochs 1--8).}
+Only the Bridge, multi-texture mask head, and dustbin embedding are trainable (${\sim}4.4$M parameters). Qwen LoRA is frozen; the SEG embedding and \texttt{lm\_head} rows are frozen at their warm-started values (Section~\ref{sec:count_collapse}); SAM (including the reused resizer) is frozen. The Bridge absorbs the random-initialisation shock and learns the shape-matching $4096 \to 1024$ map into SAM's native text space under heavy Dropout(0.4) regularization before any linguistic gradients enter the system.
 
-\paragraph{Stage 2: Qwen Sync + Bridge Decay (Epochs 13--20).}
-Qwen's LoRA adapters (rank 8, targeting \texttt{q\_proj} and \texttt{v\_proj}; ${\sim}3.8$M parameters) are unfrozen at an ultra-conservative learning rate of $1 \times 10^{-6}$ ($0.01\times$ the base rate). Simultaneously, the Bridge's learning rate is \emph{decayed by $10\times$} (from $1 \times 10^{-4}$ to $1 \times 10^{-5}$). This decay is critical: prior ablation showed that maintaining the projector at full LR during co-training causes \emph{Latent Co-Adaptation Churn}---the projector's rapid weight updates continuously shift the feature distribution that the LoRA is trying to adapt to, preventing stable co-convergence. By slowing the Bridge once Qwen joins, we ensure the LoRA builds on a stable mapping rather than chasing a moving target. The exponential LM cliff (Section~\ref{sec:count_collapse}) preserves linguistic coherence throughout.
+\paragraph{Stage 2: Qwen Sync + Bridge Decay + SEG Rows (Epochs 9--30).}
+Three components activate simultaneously: (i) Qwen's LoRA adapters (rank 8, \texttt{q\_proj}+\texttt{v\_proj}; ${\sim}3.8$M parameters) are unfrozen at learning rate $1 \times 10^{-6}$ ($0.01\times$ base); (ii) the masked-row SEG training (Section~\ref{sec:count_collapse}) unlocks the SEG rows of \texttt{embed\_tokens} and \texttt{lm\_head} (16{,}384 effective parameters), enabling the model to learn to emit \texttt{[SEG]}; (iii) the Bridge's learning rate is \emph{decayed by $10\times$} (from $1 \times 10^{-4}$ to $1 \times 10^{-5}$). The Bridge decay is critical: maintaining the projector at full LR during co-training causes \emph{Latent Co-Adaptation Churn}---the projector's rapid weight updates continuously shift the feature distribution that the LoRA is trying to adapt to, preventing stable co-convergence. By slowing the Bridge once Qwen joins, we ensure the LoRA builds on a stable mapping rather than chasing a moving target. The Shifted-Zero cliff (Section~\ref{sec:count_collapse}) preserves linguistic coherence throughout.
 
-There is no Stage~3. SAM~3 (including its resizer, cross-attention, and decoder) remains frozen across all 20 epochs.
+There is no Stage~3. SAM~3 (including its resizer, cross-attention, and decoder) remains frozen across all 30 epochs.
 
-The total loss combines mask supervision with the exponential-weighted language loss:
+The total loss combines mask supervision with the Shifted-Zero-weighted language loss:
 \begin{equation}
-    \mathcal{L} = \underbrace{\mathcal{L}_{\text{CE}}^{\text{mask}} + 3.0 \cdot \mathcal{L}_{\text{Dice}}}_{\text{mask losses}} + 0.1 \cdot \underbrace{\mathcal{L}_{\text{LM}}^{\text{exp}}}_{\text{exponential cliff}}
+    \mathcal{L} = \underbrace{\mathcal{L}_{\text{CE}}^{\text{mask}} + 3.0 \cdot \mathcal{L}_{\text{Dice}}}_{\text{mask losses}} + 0.1 \cdot \underbrace{\mathcal{L}_{\text{LM}}^{\text{SZ}}}_{\text{Shifted-Zero cliff}}
 \end{equation}
 No orthogonal regularization term appears in the final loss (the SAM LoRA it previously regularised is retired).
+
+\paragraph{Micro-Warmup Restart for Extension Runs.}
+An initial 20-epoch schedule under a cosine LR curve yielded a peak at epoch 16 (live-inference honest RWTD mIoU = 0.794). To push further without a full LR re-warmup---which would shock weights already sitting in a good basin---we introduce a \emph{Micro-Warmup Restart} protocol. On resume from a late-stage checkpoint, we (a) rebuild the LR scheduler with each parameter group's peak set to \texttt{original\_base\_LR} $\times s$ (with $s = 0.15$ in our run), preserving per-group ratios between Bridge, Qwen LoRA, and SEG rows; (b) apply a short linear warmup (2 epochs) from zero to the scaled peak; (c) cosine-decay over the remaining epochs only. AdamW moment estimates are preserved across the restart, so the optimisation trajectory that produced the pre-restart optimum is retained; only the LR envelope changes.
 
 % ============================================================================
 % 4. DATA ECOSYSTEM
 % ============================================================================
-\section{Data Ecosystem: The DeTexture Pipeline and Dual-Evaluation Strategy}
+\section{Data Ecosystem: The Detecture Pipeline and Dual-Evaluation Strategy}
 \label{sec:data}
 
 Our contribution extends beyond architecture to a complete data ecosystem designed to (a)~transform generic semantic datasets into high-quality texture-grounding training data, (b)~provide controlled in-domain evaluation, and (c)~stress-test generalization on an external, in-the-wild benchmark. This ecosystem was not merely a prerequisite for training but an active participant in architectural discovery: each pathology identified in Section~\ref{sec:context_leakage}--\ref{sec:drift} was first surfaced by evaluating on out-of-domain data whose distributional distance from the training set exposed failure modes invisible on in-domain benchmarks.
 
-\subsection{The Core Data Contribution: The DeTexture Mining Pipeline}
+\subsection{The Core Data Contribution: The Detecture Mining Pipeline}
 \label{sec:pipeline}
 
-We introduce the \textbf{DeTexture Pipeline}, an automated, scalable framework designed to transform generic semantic datasets into high-quality texture-grounding data. The pipeline operates in three stages: intelligent filtering, geometric extraction, and VLM-based annotation.
+We introduce the \textbf{Detecture Pipeline}, an automated, scalable framework designed to transform generic semantic datasets into high-quality texture-grounding data. The pipeline operates in three stages: intelligent filtering, geometric extraction, and VLM-based annotation.
 
 \paragraph{Source Material.}
 Our training pool originates from TextureSAM's~\cite{texturesam} texture-augmented ADE20K, which applies Compositional Neural Texture (CNT) synthesis at varying augmentation intensities (degree $\eta \in [0, 1]$) to the original ADE20K training split~\cite{ade20k}. This yields up to ${\sim}222{,}000$ candidate images spanning the full spectrum from original scenes ($\eta = 0$) to fully texture-replaced variants ($\eta = 1.0$). Crucially, the augmentation preserves ground-truth semantic masks across all degrees, as CNT modifies appearance but not region geometry.
@@ -321,10 +342,10 @@ with bonuses for high texture coverage and 2--4 coherent regions, and penalties 
 \paragraph{Extraction and VLM Annotation.}
 For each image passing the filter, we extract up to 5 geometrically distinct texture regions by merging per-class ADE20K masks (each region $\geq$1\% image area). We then employ Claude~3.5 Sonnet~\cite{claude} to autonomously generate rich ground-truth descriptions for each region. The VLM receives both the original image and a colored overlay showing region boundaries, and produces structured descriptions in the format ``Texture of <semantic name>, <visual features>, <spatial context>'' (10--15 words). For TextureSAM datasets, \emph{degree expansion} reuses ground-truth masks (which are degree-invariant) across higher-intensity variants, yielding ${\sim}45\%$ additional samples at zero annotation cost. The final training set comprises \textbf{${\sim}14{,}000$ samples} with an average of 3.2 texture regions per image. Full pipeline details, prompt templates, and validation procedures are provided in Appendix~B.
 
-\subsection{The Custom In-Domain Test Set (ADE20K\_DeTexture)}
-\label{sec:ade20k_detexture}
+\subsection{The Custom In-Domain Test Set (ADE20K\_Detecture)}
+\label{sec:ade20k_detecture}
 
-To enable controlled in-domain evaluation, we applied the identical DeTexture Pipeline to the \textbf{ADE20K validation split} (2,000 images), curating a dedicated test set we term \textbf{ADE20K\_DeTexture}. This custom-mined dataset retains only images with strong texture transitions and well-separated regions, providing a high-quality benchmark for verifying core architectural viability in a controlled setting where the visual distribution matches the training data. ADE20K\_DeTexture served as our stability probe: stable or improving metrics on this set confirmed that architectural changes (e.g., the bottleneck projector) did not degrade in-domain capability, even as cross-domain metrics revealed pathologies. For instance, one variant's in-domain mIoU climbed steadily from 0.700 to 0.707 across epochs 5--13 on ADE20K\_DeTexture, while RWTD mIoU simultaneously degraded from 0.692 to 0.618---a divergence that would have been invisible without dual evaluation.
+To enable controlled in-domain evaluation, we applied the identical Detecture Pipeline to the \textbf{ADE20K validation split} (2,000 images), curating a dedicated test set we term \textbf{ADE20K\_Detecture}. This custom-mined dataset retains only images with strong texture transitions and well-separated regions, providing a high-quality benchmark for verifying core architectural viability in a controlled setting where the visual distribution matches the training data. ADE20K\_Detecture served as our stability probe: stable or improving metrics on this set confirmed that architectural changes (e.g., the bottleneck projector) did not degrade in-domain capability, even as cross-domain metrics revealed pathologies. For instance, one variant's in-domain mIoU climbed steadily from 0.700 to 0.707 across epochs 5--13 on ADE20K\_Detecture, while RWTD mIoU simultaneously degraded from 0.692 to 0.618---a divergence that would have been invisible without dual evaluation.
 
 \subsection{The Adopted External Benchmark (RWTD)}
 \label{sec:rwtd}
@@ -337,9 +358,9 @@ For out-of-domain evaluation, we adopted the \textbf{Real-World Texture Dataset 
 These two benchmarks form a deliberate dual-evaluation strategy:
 
 \begin{itemize}
-    \item \textbf{In-Domain Evaluation (ADE20K\_DeTexture):} Verifies core architectural viability in a controlled setting where the visual distribution matches the training data. Stable metrics here confirm that architectural innovations do not introduce regressions.
+    \item \textbf{In-Domain Evaluation (ADE20K\_Detecture):} Verifies core architectural viability in a controlled setting where the visual distribution matches the training data. Stable metrics here confirm that architectural innovations do not introduce regressions.
 
-    \item \textbf{Out-of-Domain / Stress-Test Evaluation (RWTD):} Functions as an external, in-the-wild probe to test zero-shot generalization and deliberately expose cross-domain pathologies. RWTD's distributional distance from ADE20K was instrumental in surfacing the Directional Drift pathology (Section~\ref{sec:drift}): the 10.5M-parameter projector memorized ADE20K-specific manifold directions that compressed RWTD representations $4\times$ more aggressively, a failure mode entirely invisible on ADE20K\_DeTexture.
+    \item \textbf{Out-of-Domain / Stress-Test Evaluation (RWTD):} Functions as an external, in-the-wild probe to test zero-shot generalization and deliberately expose cross-domain pathologies. RWTD's distributional distance from ADE20K was instrumental in surfacing the Directional Drift pathology (Section~\ref{sec:drift}): the 10.5M-parameter projector memorized ADE20K-specific manifold directions that compressed RWTD representations $4\times$ more aggressively, a failure mode entirely invisible on ADE20K\_Detecture.
 \end{itemize}
 
 This dual-evaluation philosophy---verify stability in-domain, then stress-test out-of-domain---ensures that performance gains are genuine and generalizable, not artifacts of distribution overlap between training and evaluation data.
@@ -348,9 +369,13 @@ This dual-evaluation philosophy---verify stability in-domain, then stress-test o
 % 5. EXPERIMENTS
 % ============================================================================
 \section{Experiments}
+\label{sec:experiments}
+
+\paragraph{Training Protocol.}
+We train on ${\sim}14{,}000$ Detecture-mined ADE20K samples with effective batch size 8 (batch~2, grad-accum~4) for a total of 30 epochs on a single GPU in bfloat16. The schedule is a two-stage curriculum (Section~\ref{sec:curriculum}): 8 epochs of Bridge warmup under frozen Qwen, followed by 22 epochs with Qwen LoRA, masked-row SEG training, and a $10\times$ Bridge LR decay jointly active. The 30-epoch horizon is composed of an initial 20-epoch cosine run followed by a 10-epoch Micro-Warmup Restart extension at $s = 0.15$ (Section~\ref{sec:curriculum}). All results reported below use the \emph{exactly-K} prompt to neutralise the Hungarian-matching inflation that the permissive ``1 to 6'' prompt induces.
 
 \paragraph{Ablation: Pathology Resolution Impact.}
-We systematically evaluate the contribution of each architectural fix by progressively adding components and measuring cross-domain generalization on the unseen RWTD benchmark. All ``honest'' numbers use the \emph{exactly-K} prompt to neutralize Hungarian-matching inflation; the standard ``1--6'' prompt yields higher but inflated scores.
+We evaluate the contribution of each architectural fix by progressively adding components to a baseline and measuring cross-domain generalization on the unseen RWTD benchmark. Rows labelled V$k$ refer to numbered predecessor experiments documented in our ablation archive; the final row is the method proposed in this paper.
 
 \begin{table}[h]
 \centering
@@ -360,33 +385,43 @@ We systematically evaluate the contribution of each architectural fix by progres
 \textbf{Configuration} & \textbf{RWTD mIoU} & \textbf{Pathology Resolved} \\
 \midrule
 Baseline (10.5M proj, causal attn, full LM loss) & 0.544 & --- (all pathologies) \\
-+ Batch Multiplexing & 0.703 & Slot-1 Positional Bias \\
-+ Bottleneck Projector 2.1M & 0.732 & Directional Drift \\
-+ Block-Diagonal Mask + \texttt{[SEG]} (Oracle, teacher-forced) & 0.810 & Context Leakage \\
-+ Live Inference (no LM supervision) & 0.136 & --- (Language Collapse) \\
-+ Cosine-decayed LM (live, exactly-2) & 0.694 & Language Collapse \\
++ Batch Multiplexing (V2) & 0.703 & Slot-1 Positional Bias \\
++ Bottleneck Projector 2.1M (V4-Slim) & 0.732 & Directional Drift \\
++ Block-Diagonal Mask + \texttt{[SEG]} (V5 Oracle, teacher-forced) & 0.810 & Context Leakage \\
+V5 Live Inference (no LM supervision) & 0.136 & --- (Language Collapse exposed) \\
++ Cosine-decayed LM (V6, live, exactly-2) & 0.694 & Language Collapse (partial) \\
++ Bridge + Frozen Resizer + na\"ive Exponential Cliff $\lambda_{\text{SEG}} = 0$ (Oracle) & 0.738 & Bottleneck Semantic Squash \\
+\quad same configuration, \emph{live} inference & 0.000 & --- (Emission Failure exposed) \\
++ Shifted-Zero Cliff (Oracle) & 0.781 & --- \\
++ Shifted-Zero + Masked-Row SEG + Warm-Start (live, ep 16) & \textbf{0.794} & Emission Failure \\
 Zero-Shot SAM~3 + object-aware prompt (no training) & \textbf{0.928} & --- (upper bound) \\
-\textbf{+ Bridge + Frozen Resizer + Exponential LM + Frozen SAM} & \textbf{TBD (target $\geq 0.80$)} & Bottleneck Semantic Squash \\
+\textbf{Our method} (30-ep schedule with Micro-Warmup Restart; live, best) & \emph{in progress} & --- \\
 \bottomrule
 \end{tabular}
-\caption{Ablation on RWTD. Each fix addresses a distinct failure mode; the Bridge + exponential cliff targets the remaining gap between the best bottleneck-family honest number (0.694) and the ZS SAM upper bound (0.928).}
+\caption{Ablation on RWTD. Each fix addresses a distinct failure mode. Widening into SAM~3's native 1024-dim text space closes $+0.04$ on the teacher-forced Oracle. The na\"ive exponential cliff ($\lambda_{\text{SEG}} = 0$) inadvertently erases the emission-learning signal and drives live-inference mIoU to exactly $0.0$ despite Oracle continuing to rise---isolating the Emission Failure pathology invisible under teacher forcing. Shifting the zero one position forward and warm-starting the SEG rows from \texttt{<|im\_end|>} under masked-row routing closes the live gap to $0.794$ at epoch 16, \emph{surpassing} the best teacher-forced number from any prior bottleneck-family variant.}
 \label{tab:ablation}
 \end{table}
 
-\emph{Training is in progress. Final quantitative results on RWTD and ADE20K\_DeTexture, the gap to the ZS SAM upper bound, comparison with LISA and Sa2VA baselines, and qualitative visualisations will be reported upon convergence.}
+\paragraph{Live vs.\ Oracle at epoch 16.}
+Notably, live-inference mIoU (0.794) slightly \emph{exceeds} teacher-forced Oracle mIoU (0.781) at the same checkpoint. We attribute this to distributional mismatch: Oracle feeds the Bridge with \texttt{[SEG]} hidden states produced under a fixed ``1 to 6'' prompt, whereas live inference uses the actual two-texture prompt the model was trained to handle. The gap disappears under a matched prompt.
+
+\emph{Training is in progress under the Micro-Warmup Restart extension (epochs 21--30). Final quantitative results on RWTD and ADE20K\_Detecture, comparison with LISA and Sa2VA baselines, and qualitative visualisations will be reported upon convergence.}
 
 % ============================================================================
 % 6. CONCLUSION
 % ============================================================================
 \section{Conclusion and Future Work}
 
-We have presented Qwen2SAM-DeTexture, an end-to-end architecture for parallel, multi-texture segmentation that bridges vision-language reasoning with geometric dense prediction. Through systematic ablation, we identified and resolved five fundamental pathologies---Context Leakage, Slot-1 Positional Bias, the Count Collapse / Language Collapse dilemma, Directional Drift, and Bottleneck Semantic Squash---that prevent existing VLM-segmentation architectures from scaling to multi-target grounding. Our solutions---block-diagonal attention masking, batch multiplexing, the exponential LM-loss cliff, and a Bridge-to-Native-Space projector that reuses SAM~3's own pretrained resizer---are general mechanisms applicable to any system coupling autoregressive VLM decoding with SAM-family decoders. The Zero-Shot SAM~3 experiment (0.928 RWTD mIoU with a hand-crafted object-aware prompt) is particularly instructive: it suggests that for any pretrained segmentation backbone, the correct role of a learned projector is \emph{not} to acquire a new semantic mapping but to preserve the one the backbone already carries. The Bridge + frozen-resizer design is a minimal realization of this principle.
+We have presented Qwen2SAM-Detecture, an end-to-end architecture for parallel, multi-texture segmentation that bridges vision-language reasoning with geometric dense prediction. Through systematic ablation, we identified and resolved five fundamental pathologies---Context Leakage, Slot-1 Positional Bias, the Count Collapse / Language Collapse dilemma, Directional Drift, and Bottleneck Semantic Squash---plus a subtle \emph{Emission Failure} mode that emerges once the Count/Language dilemma is na\"ively resolved and which we cure with a Shifted-Zero cliff and masked-row trainable SEG rows. Our solutions---block-diagonal attention masking, batch multiplexing, the Shifted-Zero LM-loss cliff with masked-row training and warm-start from \texttt{<|im\_end|>}, and a Bridge-to-Native-Space projector that reuses SAM~3's own pretrained resizer---are general mechanisms applicable to any system coupling autoregressive VLM decoding with SAM-family decoders. The Zero-Shot SAM~3 experiment (0.928 RWTD mIoU with a hand-crafted object-aware prompt) is particularly instructive: it suggests that for any pretrained segmentation backbone, the correct role of a learned projector is \emph{not} to acquire a new semantic mapping but to preserve the one the backbone already carries. The Bridge + frozen-resizer design is a minimal realization of this principle.
+
+\paragraph{Limitations.}
+Several limitations bound the current work. \textbf{(1) Inference cost.} The two-pass protocol---autoregressive generation followed by block-diagonal extraction---is substantially slower than prompt-based segmentation; end-to-end latency is dominated by Qwen generation (${\approx}\,1$--$2$\,s per image on a single GPU) and scales with the number of predicted textures. \textbf{(2) SAM~3 as a hard ceiling.} Our frozen-SAM policy inherits SAM~3's semantic coverage: the 0.928 ZS upper bound on RWTD tightly upper-bounds the method on any domain where SAM natively understands descriptions, and leaves no recourse for domains where it does not. Unfreezing SAM to cross that ceiling consistently regressed out-of-domain generalisation in our ablations. \textbf{(3) Narrow benchmark.} RWTD contains 253 samples; honest exactly-$K$ numbers are stable but a richer multi-domain evaluation would strengthen the cross-domain claims. \textbf{(4) Hungarian-matching illusion.} The common ``1 to 6'' prompt inflates scores via Hungarian assignment over permissively-many predicted regions; we therefore report exactly-$K$ as the honest metric, but deployed systems receiving an unknown target count remain sensitive to prompt phrasing. \textbf{(5) Emission remains a learned behaviour.} Even with Shifted-Zero and masked-row training, \texttt{[SEG]} emission is not guaranteed under sufficiently out-of-distribution prompts; recovery requires either prompt normalisation or fallback regex extraction. \textbf{(6) Texture-specific framing.} We evaluate on texture segmentation; extending the method to open-vocabulary scene partitioning is plausible (below) but not empirically validated here.
 
 \paragraph{Auto-Iterative Refinement.}
 A promising direction for future work is inference-time optimization without additional training. The current architecture produces masks in a single forward pass; however, the initial segmentation output contains rich geometric information that could be fed back to improve itself. Specifically, we envision extracting geometric center-of-mass points from each predicted mask region and injecting them into SAM's sparse prompt encoder \emph{alongside} the dense \texttt{[SEG]} embedding in a second refinement pass. This auto-iterative loop would provide SAM with both semantic guidance (from the \texttt{[SEG]} token) and spatial guidance (from the center-of-mass points), effectively combining the complementary strengths of dense and sparse prompting. Preliminary analysis suggests this could push performance past the current single-pass ceiling without requiring retraining, as SAM's point-prompt pathway is already well-calibrated from pretraining.
 
 \paragraph{Scaling to Open-Vocabulary Partitioning.}
-While we evaluate on texture segmentation, the architectural innovations are domain-agnostic. Extending Qwen2SAM-DeTexture to open-vocabulary scene partitioning---where the model autonomously identifies and segments arbitrary semantic regions (not just textures)---requires only expanding the training data domain while the architectural mechanisms remain unchanged.
+While we evaluate on texture segmentation, the architectural innovations are domain-agnostic. Extending Qwen2SAM-Detecture to open-vocabulary scene partitioning---where the model autonomously identifies and segments arbitrary semantic regions (not just textures)---requires only expanding the training data domain while the architectural mechanisms remain unchanged.
 
 % ============================================================================
 % REFERENCES
@@ -496,5 +531,26 @@ C.~Zhang, Y.~Qiao, S.~Tariq, S.~Zheng, C.~Zhang, C.~Li, H.~Shin, and C.~S.~Hong.
 \newblock \emph{arXiv:2311.11465}, 2023.
 
 \end{thebibliography}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% TECHNICAL APPENDICES (do not count toward 9-page limit)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\appendix
+
+\section{Detecture scoring formulas and thresholds}
+\label{app:scoring}
+The Detecture Pipeline (Section~\ref{sec:pipeline}) selects images via a composite score $s \in [0, 100]$ combining a mask-structure prior $s_A$ and a boundary-quality prior $s_{\text{geom}}$, weighted toward geometry: $s = 0.20 \cdot s_A + 0.60 \cdot s_{\text{geom}} + \text{bonuses} - \text{penalties}$. The mask-structure prior $s_A$ aggregates region count (2--4 preferred), size distribution (balanced vs.\ fragmented), and region entropy. The boundary-quality prior $s_{\text{geom}}$ aggregates gradient-transition strength along ground-truth boundaries, boundary coherence (fraction of pixels belonging to coherent edge segments), and area balance across regions. Bonuses are applied when ${\geq}65\%$ of pixels lie in texture-classified regions and when region count $\in \{2, 3, 4\}$. Penalties apply to object-dominated scenes (as determined by ADE20K class membership in our 32-term ``object'' list) and to scenes with more than 8 distinct regions. Images scoring below 65 are discarded; the final training set contains ${\sim}14{,}000$ images with an average of 3.2 regions each. The full semantic-keyword classification table (72 texture terms / 32 object terms / 10 ambiguous terms) is provided as a JSON file in the supplementary archive.
+
+\section{VLM annotation prompt templates and validation}
+\label{app:annotation}
+For each filtered image, we extract up to 5 geometrically distinct texture regions by merging per-class ADE20K masks (each region $\geq 1\%$ image area). We then prompt Claude~3.5~Sonnet~\cite{claude} with both the original image and a colored-overlay visualisation showing the region boundaries, and ask for structured descriptions in the fixed template \texttt{"Texture of <semantic name>, <visual features>, <spatial context>"} at 10--15 words per region. The exact system prompt, user prompt, and few-shot examples used at annotation time are provided in the supplementary archive. Validation: we randomly sampled 100 images from the mined training set and manually verified that every emitted description (a) correctly names the material or surface type, (b) mentions at least one visual feature (colour, pattern, coarseness), and (c) anchors a spatial context (foreground / background / region). Pass rate was 96\%; the 4\% failures were all cases where the region was ambiguous (e.g., reflective glass) and the VLM produced a plausible but non-specific description rather than an incorrect one. For TextureSAM degree variants ($\eta > 0$), descriptions are reused from the $\eta = 0$ anchor since CNT augmentation preserves region geometry; this degree-expansion step yielded ${\sim}45\%$ additional samples at zero annotation cost.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% NEURIPS PAPER CHECKLIST (do not count toward 9-page limit)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\newpage
+\input{checklist.tex}
 
 \end{document}

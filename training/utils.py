@@ -1,5 +1,5 @@
 """
-Training utilities for Qwen2SAM-DeTexture.
+Training utilities for Qwen2SAM-Detecture.
 
 Standalone implementations — no cross-project imports.
 """
@@ -132,8 +132,23 @@ def load_checkpoint(model, optimizer, path, device="cuda"):
         if name in model_state:
             model_state[name].copy_(data)
 
-    # Restore optimizer
+    # Restore optimizer — tolerate param-group mismatches that occur when
+    # the checkpoint was saved with a smaller set of trainable groups
+    # (e.g. resuming a Stage-1 checkpoint after new groups have been added
+    # in Stage 2, such as the masked-row SEG output embeddings). In that
+    # case we skip the optimizer-state reload and let AdamW restart its
+    # moment estimates from zero — correct behaviour for newly-added groups.
     if optimizer is not None and "optimizer" in state:
-        optimizer.load_state_dict(state["optimizer"])
+        saved = state["optimizer"]
+        n_saved = len(saved.get("param_groups", []))
+        n_current = len(optimizer.param_groups)
+        if n_saved != n_current:
+            print(f"  WARNING: optimizer param_group count mismatch "
+                  f"(saved={n_saved}, current={n_current}). "
+                  f"Skipping optimizer-state restore — AdamW moments will "
+                  f"reinitialise. Trainable weights still loaded from "
+                  f"'model_trainable'.")
+        else:
+            optimizer.load_state_dict(saved)
 
     return state.get("epoch", 0)

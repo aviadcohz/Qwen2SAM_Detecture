@@ -48,9 +48,9 @@ from scipy.optimize import linear_sum_assignment
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from models.qwen2sam_detexture import Qwen2SAMDeTexture, MAX_TEXTURES, SEG_TOKEN
+from models.qwen2sam_detecture import Qwen2SAMDetecture, MAX_TEXTURES, SEG_TOKEN
 from data.dataset import (
-    DeTextureCollator, SYSTEM_PROMPT, TRAIN_USER_PROMPT, build_assistant_text,
+    DetectureCollator, SYSTEM_PROMPT, TRAIN_USER_PROMPT, build_assistant_text,
     preprocess_image_for_sam3, SAM3_SIZE,
 )
 from training.utils import load_config, load_checkpoint
@@ -175,7 +175,7 @@ def oracle_forward_one(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/detexture.yaml")
+    parser.add_argument("--config", default="configs/detecture.yaml")
     parser.add_argument("--checkpoint", required=True,
                         help="Path to V7 checkpoint (e.g. checkpoints/epoch_4.pt)")
     parser.add_argument(
@@ -214,13 +214,13 @@ def main():
         pass
 
     print(f"Loading model...")
-    model = Qwen2SAMDeTexture(cfg, device=str(device))
+    model = Qwen2SAMDetecture(cfg, device=str(device))
     print(f"Loading checkpoint: {ckpt_path}")
     epoch_idx = load_checkpoint(model, None, str(ckpt_path), device=str(device))
     print(f"  Resumed at epoch index {epoch_idx} (displayed Epoch {epoch_idx + 1})")
     model.eval()
 
-    collator = DeTextureCollator(model.processor, inference=False)
+    collator = DetectureCollator(model.processor, inference=False)
 
     # ------------------------------------------------------------------ #
     # Load GT text

@@ -114,8 +114,8 @@
       "epochs_trained": 35,
       "phase1_best_val": 0.6564962771883462,
       "phase2_best_val": 0.8158163955899478,
-      "test_ade20k_detexture_miou": 0.5474,
-      "test_ade20k_detexture_epoch": 35
+      "test_ade20k_detecture_miou": 0.5474,
+      "test_ade20k_detecture_epoch": 35
     },
     "epoch_history": [
       {

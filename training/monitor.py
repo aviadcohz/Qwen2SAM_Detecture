@@ -1,5 +1,5 @@
 """
-Training monitor for Qwen2SAM-DeTexture.
+Training monitor for Qwen2SAM-Detecture.
 
 Provides:
   1. DataSanityChecker — Validate data pipeline at startup (image-mask alignment, batch integrity)
@@ -752,14 +752,14 @@ class TestEvaluator:
 
         Returns dict with metrics: test_miou, test_mari, per_sample_results.
         """
-        from data.dataset import DeTextureDataset, DeTextureCollator
+        from data.dataset import DetectureDataset, DetectureCollator
 
-        test_ds = DeTextureDataset(
+        test_ds = DetectureDataset(
             self.test_metadata,
             image_size=self.image_size,
             augment=False,
         )
-        collator = DeTextureCollator(processor, inference=True)
+        collator = DetectureCollator(processor, inference=True)
         test_loader = torch.utils.data.DataLoader(
             test_ds, batch_size=1, shuffle=False,
             num_workers=0, collate_fn=collator,

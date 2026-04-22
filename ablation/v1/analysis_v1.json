@@ -1,11 +1,11 @@
 {
-  "study_title": "Qwen2SAM_DeTexture Ablation Study",
+  "study_title": "Qwen2SAM_Detecture Ablation Study",
   "date": "2026-04-08",
   "model": "Qwen3-VL-8B (LoRA) + SAM3 (Orthogonal LoRA) + MLP Projector",
   "training_data": "ADE20K_textured_images (13,331 train / 1,482 val)",
   "test_sets": {
     "RWTD": {"samples": 253, "domain": "256x256 texture crops", "in_sam3_training": false},
-    "ADE20k_DeTexture": {"samples": 212, "domain": "full scene images", "overlap_with_train": "92%"}
+    "ADE20k_Detecture": {"samples": 212, "domain": "full scene images", "overlap_with_train": "92%"}
   },
   "baselines": {
     "generic_zero_shot": {"rwtd_miou": 0.7063, "rwtd_mari": 0.6879},
@@ -45,12 +45,12 @@
     },
     {
       "finding": "Inference gap: val mIoU >> test mIoU on SAME distribution",
-      "evidence": "At epoch 35, val mIoU=0.813 but ADE20k_DeTexture test mIoU=0.547 (92% image overlap with training). The gap is entirely in the inference path — teacher forcing gives perfect embeddings, but inference_forward (autoregressive generation) produces weaker/wrong embeddings and incorrect k_pred.",
-      "runs_compared": ["run_4 val vs ADE20k_DeTexture test"]
+      "evidence": "At epoch 35, val mIoU=0.813 but ADE20k_Detecture test mIoU=0.547 (92% image overlap with training). The gap is entirely in the inference path — teacher forcing gives perfect embeddings, but inference_forward (autoregressive generation) produces weaker/wrong embeddings and incorrect k_pred.",
+      "runs_compared": ["run_4 val vs ADE20k_Detecture test"]
     },
     {
       "finding": "k_pred is unreliable during inference",
-      "evidence": "On ADE20k_DeTexture: 25% predict k=1 (under-segmentation), 20% predict k=6 (over-segmentation). Model has no count supervision during training (teacher forcing always provides correct count). Median k_pred=5 vs typical k_gt=3-4.",
+      "evidence": "On ADE20k_Detecture: 25% predict k=1 (under-segmentation), 20% predict k=6 (over-segmentation). Model has no count supervision during training (teacher forcing always provides correct count). Median k_pred=5 vs typical k_gt=3-4.",
       "runs_compared": ["run_4 test analysis"]
     }
   ],
@@ -98,7 +98,7 @@
       "priority": 5,
       "action": "Test on truly out-of-distribution benchmarks",
       "rationale": "BSDS500 (boundary detection), DTD (texture classification) are unseen by SAM3 and would measure true generalization beyond ADE20K/RWTD.",
-      "datasets": ["BSDS500 (500 images, public)", "DTD (5640 images, public)", "PASCAL Context (260 scored in DeTexture)"]
+      "datasets": ["BSDS500 (500 images, public)", "DTD (5640 images, public)", "PASCAL Context (260 scored in Detecture)"]
     }
   ]
 }
